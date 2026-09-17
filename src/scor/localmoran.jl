@@ -18,9 +18,13 @@ Compute the Local Moran test of spatial autocorrelation.
 - `permutations=9999`: number of permutations for the randomization test.
 - `rng=default_rng()`: random number generator for the randomization test.
 - `corrected=true`: divide the scaling factor by ``n-1`` instead of ``n``.
+- `backend=nothing`: execution backend (e.g. `MetalBackend()`, `CUDABackend()`, or `:gpu`).
+- `return_perms=true`: whether to return the full (n x permutations) matrix in the result struct.
+- `seed=nothing`: optional integer random seed for GPU PRNG.
 """
 function localmoran(x::AbstractVector{T} where T, W::SpatialWeights; permutations::Int = 9999,
-    corrected::Bool = true, rng::AbstractRNG = default_rng())::LocalMoran
+    corrected::Bool = true, rng::AbstractRNG = default_rng(),
+    backend = nothing, return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing)::LocalMoran
 
     n = length(x)
     z = x .- mean(x)    
@@ -45,19 +49,26 @@ function localmoran(x::AbstractVector{T} where T, W::SpatialWeights; permutation
         I[i] = localmoran_calc(z[i], weights(W, i), z[neighbors(W, i)]) 
     end
 
-    # Conditional randomizatoin
-    Iperms = crand_local(permutations, z, W, localmoran_calc, rng)
-    
-    larger = sum(Iperms .>= repeat(I, 1, permutations), dims = 2)
-    low = (permutations .- larger) .< larger
-    larger[low] .= permutations .- larger[low]
-    p = (larger .+ 1) ./ (permutations + 1)
-    p = vec(p)
+    # Conditional randomization
+    if backend !== nothing
+        Iperms, p, Ipermsmean, Ipermsstd, zval = crand_local_gpu(
+            backend, :moran, permutations, z, W, I, m2;
+            return_perms=return_perms, seed=seed
+        )
+    else
+        Iperms = crand_local(permutations, z, W, localmoran_calc, rng)
+        
+        larger = sum(Iperms .>= repeat(I, 1, permutations), dims = 2)
+        low = (permutations .- larger) .< larger
+        larger[low] .= permutations .- larger[low]
+        p = (larger .+ 1) ./ (permutations + 1)
+        p = vec(p)
 
-    Ipermsstd = vec(std(Iperms, dims = 2, corrected = false))
-    Ipermsmean = vec(mean(Iperms, dims = 2))
-    zval = (I .- Ipermsmean)  ./ Ipermsstd
-    zval = vec(zval)
+        Ipermsstd = vec(std(Iperms, dims = 2, corrected = false))
+        Ipermsmean = vec(mean(Iperms, dims = 2))
+        zval = (I .- Ipermsmean)  ./ Ipermsstd
+        zval = vec(zval)
+    end
 
     # Classification
     q = Array{Symbol}(undef, n)

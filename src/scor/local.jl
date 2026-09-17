@@ -1,6 +1,9 @@
 # Abstract type for Local Spatial Autocorrelation
 abstract type AbstractLocalSpatialAutocorrelation end
 
+# Function hook for GPU / KernelAbstractions extension
+function crand_local_gpu end
+
 # Function to build the conditional randomization sample and calculate the local scores
 function crand_local(permutations::Int, z::AbstractVector{T} where T, W::SpatialWeights, local_calc_function::Function, rng::AbstractRNG)::Matrix{Float64}
     # Build conditional permutations array

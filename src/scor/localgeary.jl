@@ -20,10 +20,14 @@ Compute the Local Geary test of spatial autocorrelation.
 - `rng=default_rng()`: random number generator for the randomization test.
 - `corrected=true`: divide the scaling factor by ``n-1`` instead of ``n``.
 - `categories=:positivenegative`: assing observations to positive or negative spatial autocorrelation, or in combination with the `:moran` scatterplot.
+- `backend=nothing`: execution backend (e.g. `MetalBackend()`, `CUDABackend()`, or `:gpu`).
+- `return_perms=true`: whether to return the full (n x permutations) matrix in the result struct.
+- `seed=nothing`: optional integer random seed for GPU PRNG.
 """
 function localgeary(x::AbstractVector{T} where T, W::SpatialWeights; permutations::Int = 9999,
     corrected::Bool = true, categories::Symbol = :positivenegative,
-    rng::AbstractRNG = default_rng())::LocalGeary
+    rng::AbstractRNG = default_rng(),
+    backend = nothing, return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing)::LocalGeary
 
     (categories == :positivenegative) || (categories == :moran) || throw(ArgumentError("`categories` must be :positivenegative or :moran"))
 
@@ -51,20 +55,26 @@ function localgeary(x::AbstractVector{T} where T, W::SpatialWeights; permutation
         C[i] = localgeary_calc(zi, wi, zneighi) 
     end
 
-    # Conditional randomizatoin
-    Cperms = crand_local(permutations, z, W, localgeary_calc, rng)
-    
-    larger = sum(Cperms .>= repeat(C, 1, permutations), dims = 2)
-    low = (permutations .- larger) .< larger
-    larger[low] .= permutations .- larger[low]
-    p = (larger .+ 1) ./ (permutations + 1)
-    p = vec(p)
+    # Conditional randomization
+    if backend !== nothing
+        Cperms, p, Cpermsmean, Cpermsstd, zval = crand_local_gpu(
+            backend, :geary, permutations, z, W, C, m2;
+            return_perms=return_perms, seed=seed
+        )
+    else
+        Cperms = crand_local(permutations, z, W, localgeary_calc, rng)
+        
+        larger = sum(Cperms .>= repeat(C, 1, permutations), dims = 2)
+        low = (permutations .- larger) .< larger
+        larger[low] .= permutations .- larger[low]
+        p = (larger .+ 1) ./ (permutations + 1)
+        p = vec(p)
 
-    
-    Cpermsstd = vec(std(Cperms, dims = 2, corrected = false))
-    Cpermsmean = vec(mean(Cperms, dims = 2))
-    zval = (C .- Cpermsmean)  ./ Cpermsstd
-    zval = vec(zval)
+        Cpermsstd = vec(std(Cperms, dims = 2, corrected = false))
+        Cpermsmean = vec(mean(Cperms, dims = 2))
+        zval = (C .- Cpermsmean)  ./ Cpermsstd
+        zval = vec(zval)
+    end
 
     # Classification
     Cmean = mean(C)

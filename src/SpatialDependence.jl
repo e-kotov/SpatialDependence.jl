@@ -24,6 +24,9 @@ module SpatialDependence
         # Types
         SpatialWeights,
 
+        # Spatial autocorrelation hook for GPU extension
+        crand_local_gpu,
+
         # Spatial Weights Creation functions
         dnearneigh,
         knearneigh,

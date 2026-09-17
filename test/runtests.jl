@@ -12,5 +12,6 @@ using Test
     include("bostonhsg.jl")
     include("maps.jl")
     include("random.jl")
+    include("gpu_tests.jl")
 
 end

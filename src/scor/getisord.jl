@@ -19,9 +19,13 @@ Compute the Getis-Ord statistic.
 - `star=true`: compute the Gi* statistic, or the Gi if set to `false`.
 - `permutations=9999`: number of permutations for the randomization test.
 - `rng=default_rng()`: random number generator for the randomization test.
+- `backend=nothing`: execution backend (e.g. `MetalBackend()`, `CUDABackend()`, or `:gpu`).
+- `return_perms=true`: whether to return the full (n x permutations) matrix in the result struct.
+- `seed=nothing`: optional integer random seed for GPU PRNG.
 """
 function getisord(x::AbstractVector{T} where T, W::SpatialWeights; permutations::Int = 9999,
-    star::Bool = true, rng::AbstractRNG = default_rng())::GetisOrd
+    star::Bool = true, rng::AbstractRNG = default_rng(),
+    backend = nothing, return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing)::GetisOrd
 
     wt = wtransformation(W) 
     wt == :row || wt == :binary || throw(ArgumentError("W must be row standardized or binary"))
@@ -59,20 +63,27 @@ function getisord(x::AbstractVector{T} where T, W::SpatialWeights; permutations:
         G[i] = getisord_calc_fun(xi, wi, xneighi) 
     end
 
-    # Conditional randomizatoin
-    Gperms = crand_local(permutations, x, W, getisord_calc_fun, rng)
-    
-    larger = sum(Gperms .>= repeat(G, 1, permutations), dims = 2)
-    low = (permutations .- larger) .< larger
-    larger[low] .= permutations .- larger[low]
-    p = (larger .+ 1) ./ (permutations + 1)
-    p = vec(p)
+    # Conditional randomization
+    if backend !== nothing
+        stat_sym = star ? :getisord_star : :getisord
+        Gperms, p, Gpermsmean, Gpermsstd, zval = crand_local_gpu(
+            backend, stat_sym, permutations, x, W, G, denon;
+            return_perms=return_perms, seed=seed
+        )
+    else
+        Gperms = crand_local(permutations, x, W, getisord_calc_fun, rng)
+        
+        larger = sum(Gperms .>= repeat(G, 1, permutations), dims = 2)
+        low = (permutations .- larger) .< larger
+        larger[low] .= permutations .- larger[low]
+        p = (larger .+ 1) ./ (permutations + 1)
+        p = vec(p)
 
-    
-    Gpermsstd = vec(std(Gperms, dims = 2, corrected = false))
-    Gpermsmean = vec(mean(Gperms, dims = 2))
-    zval = (G .- Gpermsmean)  ./ Gpermsstd
-    zval = vec(zval)
+        Gpermsstd = vec(std(Gperms, dims = 2, corrected = false))
+        Gpermsmean = vec(mean(Gperms, dims = 2))
+        zval = (G .- Gpermsmean)  ./ Gpermsstd
+        zval = vec(zval)
+    end
 
     # Classification
     q = Array{Symbol}(undef, n)
