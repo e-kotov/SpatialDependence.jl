@@ -13,5 +13,6 @@ using Test
     include("maps.jl")
     include("random.jl")
     include("gpu_tests.jl")
+    include("exact_tail_helpers.jl")
 
 end

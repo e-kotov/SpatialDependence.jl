@@ -7,7 +7,7 @@ module SpatialDependence
     """    
 
     using NearestNeighbors: KDTree, knn, inrange
-    using Random: shuffle, AbstractRNG, default_rng
+    using Random: shuffle, AbstractRNG, MersenneTwister, default_rng
     #using RecipesBase
     using Tables: istable, getcolumn
 
@@ -23,9 +23,6 @@ module SpatialDependence
     export 
         # Types
         SpatialWeights,
-
-        # Spatial autocorrelation hook for GPU extension
-        crand_local_gpu,
 
         # Spatial Weights Creation functions
         dnearneigh,

@@ -107,8 +107,10 @@
         @test std(lmguerry)[81:85] ≈ [0.315696; 0.320665; 0.58715; 0.514386; 0.197625] atol = 1e-5
         @test zscore(lmguerry)[1:5] ≈ [-0.654535; 2.240454; 2.44964; 0.435151; 0.01585] atol = 1e-5
         @test zscore(lmguerry)[81:85] ≈ [0.872291; 1.903161; 2.576463; 4.213106; 1.044118] atol = 1e-5
-        @test pvalue(lmguerry)[1:5] ≈ [0.2536; 0.0148; 0.0044; 0.3323; 0.4805] atol = 1e-4   
-        @test pvalue(lmguerry)[81:85] ≈ [0.2015; 0.0239; 0.0021; 0.0001; 0.1532] atol = 1e-4   
+        # Inclusive upper/lower tails were verified against an exact integer
+        # permutation oracle; ties are counted in both tails.
+        @test pvalue(lmguerry)[1:5] ≈ [0.2628; 0.0152; 0.0044; 0.3323; 0.4837] atol = 1e-4
+        @test pvalue(lmguerry)[81:85] ≈ [0.2015; 0.0240; 0.0021; 0.0001; 0.1570] atol = 1e-4
 
         @test assignments(lmguerry)[1:5] == [:LH, :HH, :LL, :HH, :HL]
         @test assignments(lmguerry)[81:85] == [:LL, :LL, :LL, :HH, :HH]
@@ -148,14 +150,14 @@
         @test std(lcguerry)[81:85] ≈ [0.950857; 0.883169; 1.389196; 0.968423; 0.490151] atol = 1e-5
         @test zscore(lcguerry)[1:5] ≈ [0.315944; -2.151836; -2.038214; -0.396441; -0.451638] atol = 1e-5
         @test zscore(lcguerry)[81:85] ≈ [-1.198872; -1.517045; -2.033677; -2.624471; -0.969228] atol = 1e-5
-        @test pvalue(lcguerry)[1:5] ≈ [0.3506; 0.0036; 0.003; 0.373; 0.3455] atol = 1e-4   
-        @test pvalue(lcguerry)[81:85] ≈ [0.0722; 0.0325; 0.0031; 0.0002; 0.1712] atol = 1e-4   
+        @test pvalue(lcguerry)[1:5] ≈ [0.3506; 0.0036; 0.003; 0.3755; 0.3455] atol = 1e-4
+        @test pvalue(lcguerry)[81:85] ≈ [0.0731; 0.0325; 0.0031; 0.0002; 0.1712] atol = 1e-4
 
         @test assignments(lcguerry)[1:5] == [:N, :P, :P, :P, :P]
         @test assignments(lcguerry)[81:85] == [:P, :P, :P, :P, :P]
         @test count(issignificant(lcguerry, 0.05, adjust = :none)) == 49
         @test count(issignificant(lcguerry, 0.01, adjust = :none)) == 29
-        @test count(issignificant(lcguerry, 0.05, adjust = :bonferroni)) == 9
+        @test count(issignificant(lcguerry, 0.05, adjust = :bonferroni)) == 8
         @test count(issignificant(lcguerry, 0.05, adjust = :fdr)) == 40
         @test assignments(lcguerry, 0.05, adjust = :none)[1:5] == [:ns, :P, :P, :ns, :ns]
         @test assignments(lcguerry, 0.05, adjust = :none)[81:85] == [:ns, :P, :P, :P, :ns]
@@ -197,8 +199,8 @@
         @test std(goguerry)[81:85] ≈ [0.002611; 0.002087; 0.00206; 0.002095; 0.00233] atol = 1e-5
         @test zscore(goguerry)[1:5] ≈ [0.654535; 2.240454; -2.44964; 0.435151; 0.01585] atol = 1e-5
         @test zscore(goguerry)[81:85] ≈ [-0.872291; -1.903161; -2.576463; 4.213106; 1.044118] atol = 1e-5
-        @test pvalue(goguerry)[1:5] ≈ [0.2628; 0.0147; 0.0042; 0.3323; 0.4833] atol = 1e-4   
-        @test pvalue(goguerry)[81:85] ≈ [0.1931; 0.0224; 0.0018; 0.0001; 0.157] atol = 1e-4   
+        @test pvalue(goguerry)[1:5] ≈ [0.2628; 0.0152; 0.0044; 0.3323; 0.4837] atol = 1e-4
+        @test pvalue(goguerry)[81:85] ≈ [0.2015; 0.0240; 0.0021; 0.0001; 0.1570] atol = 1e-4
 
         @test assignments(goguerry)[1:5] == [:H, :H, :L, :H, :H]
         @test assignments(goguerry)[81:85] == [:L, :L, :L, :H, :H]

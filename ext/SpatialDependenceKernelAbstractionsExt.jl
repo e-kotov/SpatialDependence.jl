@@ -2,9 +2,38 @@ module SpatialDependenceKernelAbstractionsExt
 
 using SpatialDependence
 using KernelAbstractions
+using Random: AbstractRNG, default_rng, rand
 using Statistics: mean
 
-# Fast 64-bit SplitMix PRNG for device threads
+include("SpatialDependenceKernelAbstractionsExact.jl")
+
+const _GPU_PRIVATE_CROSSOVER = 256
+const _GPU_DEFAULT_SCRATCH_BUDGET = 64 * 1024 * 1024
+const _GPU_SCRATCH_BUDGET = Ref{Int}(_GPU_DEFAULT_SCRATCH_BUDGET)
+
+"""Internal test hook; deliberately not part of the public keyword API."""
+function _set_gpu_scratch_budget!(bytes::Integer)
+    bytes > 0 || throw(ArgumentError("GPU scratch budget must be positive"))
+    old = _GPU_SCRATCH_BUDGET[]
+    _GPU_SCRATCH_BUDGET[] = Int(bytes)
+    return old
+end
+
+const _GPU_CHUNK_COUNT_OVERRIDE = Ref{Int}(0)
+
+"""
+Internal test hook; deliberately not part of the public keyword API.
+
+`0` restores the default rule.  Streams are keyed by (observation, permutation),
+so the chunk count only decides how permutations are spread over workers.
+"""
+function _set_gpu_chunk_count!(chunks::Integer)
+    chunks >= 0 || throw(ArgumentError("GPU chunk count override must be nonnegative"))
+    old = _GPU_CHUNK_COUNT_OVERRIDE[]
+    _GPU_CHUNK_COUNT_OVERRIDE[] = Int(chunks)
+    return old
+end
+
 @inline function splitmix64(state::UInt64)
     state += 0x9e3779b97f4a7c15
     z = state
@@ -13,263 +42,626 @@ using Statistics: mean
     return (z ⊻ (z >> 31)), state
 end
 
-# Draw random index in 1:n excluding the focal observation
 @inline function rand_index(state::UInt64, n::Int32, exclude::Int32)
-    val, new_state = splitmix64(state)
-    idx = Int32(val % UInt64(n - Int32(1))) + Int32(1)
-    if idx >= exclude
-        idx += Int32(1)
-    end
+    value, new_state = splitmix64(state)
+    idx = unsafe_trunc(Int32, value % unsafe_trunc(UInt64, n - Int32(1))) + Int32(1)
+    idx >= exclude && (idx += Int32(1))
     return idx, new_state
 end
 
-# Pack ragged spatial weights into dense/padded device buffers
-function prepare_gpu_weights(backend, W::SpatialWeights, ::Type{T}, stat_code::Int32) where T
-    n = W.n
-    max_k = maximum(W.nneighs)
-    wt = wtransformation(W)
-    
-    padded_weights_cpu = zeros(T, max_k, n)
-    cardinalities_cpu = Int32.(W.nneighs)
+@inline function _checked_i32(value::Integer, label::AbstractString)
+    (0 <= value <= typemax(Int32)) ||
+        throw(ArgumentError("$label does not fit in the device Int32 domain"))
+    return Int32(value)
+end
 
+@inline function _chunk_start_i64(chunk_first::Int64, chunk_size::Int64)
+    return (chunk_first - Int64(1)) * chunk_size + Int64(1)
+end
+
+@inline function _chunk_end_i64(total_permutations::Int64,
+                                chunk_first::Int64,
+                                chunk_size::Int64)
+    return min(total_permutations, chunk_first * chunk_size)
+end
+
+function _checked_edges(degrees::Vector{Int})
+    total = Int64(0)
+    offsets = Vector{Int64}(undef, length(degrees) + 1)
+    offsets[1] = Int64(1)
+    for i in eachindex(degrees)
+        degree = degrees[i]
+        degree >= 0 || throw(ArgumentError("neighbor cardinalities must be nonnegative"))
+        degree <= typemax(Int64) - total || throw(ArgumentError("CSR edge count overflows Int64"))
+        total += Int64(degree)
+        offsets[i + 1] = total + Int64(1)
+    end
+    total <= typemax(Int) || throw(ArgumentError("CSR edge count exceeds host addressable storage"))
+    return offsets, Int(total)
+end
+
+"""
+Reject a structurally malformed `SpatialWeights` before any payload is built.
+
+`crand_local_gpu` constructs the exact-tail payload before `_checked_edges` and
+`_gpu_csr_host` ever look at `W`, so without this a malformed graph reaches the
+host encoder first.  That mattered: with `precision=Float32` a negative degree
+made the reference encoder's CSR edge total under-count while its row offsets
+kept advancing, and the packer wrote past the end of its own buffer, while
+`precision=Float64` (which skips the payload) correctly reported
+`ArgumentError`.  Running this first makes both precisions reject the same
+graphs with the same messages, before any RNG draw or device allocation.
+
+The classification comes from `_exact_weights_defect`, the same predicate the
+exact-tail fast path uses as its `@inbounds` precondition, so there is one
+definition of "malformed".  Degrees above `n` are not checked here: the caller's
+`max_k <= n - 1` test already reports those with its own message.
+"""
+function _validate_weights_structure(W::SpatialWeights, n::Int)
+    defect = _exact_weights_defect(W, n)
+    defect === :ok && return nothing
+    defect === :negative_degree &&
+        throw(ArgumentError("neighbor cardinalities must be nonnegative"))
+    defect === :neighbor_domain &&
+        throw(ArgumentError("neighbor index is outside the weights domain"))
+    throw(ArgumentError("spatial weights are structurally inconsistent: nneighs[i], neighs[i] and weights[i] must agree"))
+end
+
+# STORAGE_RAGGED_CSR: the production representation is flat CSR plus Int64 offsets.
+"""Build ragged CSR buffers; no n × max-degree storage is allocated."""
+function _gpu_csr_host(W::SpatialWeights, ::Type{T}, stat_code::Int32) where T
+    n = W.n
+    _checked_i32(n, "number of observations")
+    degrees = Int[Int(W.nneighs[i]) + (stat_code == Int32(4) ? 1 : 0) for i in 1:n]
+    offsets, total_edges = _checked_edges(degrees)
+    neighbors = Vector{Int32}(undef, total_edges)
+    weights = Vector{T}(undef, total_edges)
+    wt = wtransformation(W)
+    edge = 1
     for i in 1:n
-        k = W.nneighs[i]
-        for (k_idx, w) in enumerate(W.weights[i])
-            if stat_code == Int32(4)
-                wistar = (wt == :row) ? T(1.0 / (k + 1)) : T(1.0)
-                padded_weights_cpu[k_idx, i] = wistar
-            else
-                padded_weights_cpu[k_idx, i] = T(w)
+        k = Int(W.nneighs[i])
+        _checked_i32(k, "neighbor cardinality")
+        if stat_code == Int32(4)
+            wistar = wt == :row ? T(1.0 / (k + 1)) : one(T)
+            neighbors[edge] = Int32(i)
+            weights[edge] = wistar
+            edge += 1
+            for slot in 1:k
+                neighbor = W.neighs[i][slot]
+                1 <= neighbor <= n || throw(ArgumentError("neighbor index is outside the weights domain"))
+                neighbors[edge] = _checked_i32(neighbor, "neighbor index")
+                weights[edge] = wistar
+                edge += 1
+            end
+        else
+            for slot in 1:k
+                neighbor = W.neighs[i][slot]
+                1 <= neighbor <= n || throw(ArgumentError("neighbor index is outside the weights domain"))
+                neighbors[edge] = _checked_i32(neighbor, "neighbor index")
+                weights[edge] = T(W.weights[i][slot])
+                edge += 1
             end
         end
     end
-
-    padded_weights_gpu = KernelAbstractions.allocate(backend, T, max_k, n)
-    KernelAbstractions.copyto!(backend, padded_weights_gpu, padded_weights_cpu)
-
-    cardinalities_gpu = KernelAbstractions.allocate(backend, Int32, n)
-    KernelAbstractions.copyto!(backend, cardinalities_gpu, cardinalities_cpu)
-
-    return padded_weights_gpu, cardinalities_gpu, max_k
+    edge == total_edges + 1 || throw(ArgumentError("internal CSR edge-count mismatch"))
+    return weights, neighbors, offsets
 end
 
-# General permutation kernel for Local Spatial Autocorrelation
-@kernel function local_perm_chunk_kernel!(
-    partial_larger, partial_sum, partial_sum_sq, full_perms,
-    @Const(z), @Const(obs_stat), @Const(padded_weights), @Const(cardinalities),
-    n::Int32, chunk_size::Int32, total_permutations::Int32, scale::T, base_seed::UInt64,
-    stat_code::Int32, return_perms::Bool, ::Val{MAX_K}
-) where {T, MAX_K}
-    i, c = @index(Global, NTuple)
-    if i <= n
-        k = cardinalities[i]
-        p_start = (c - Int32(1)) * chunk_size + Int32(1)
-        p_end = min(total_permutations, c * chunk_size)
+"""Upload ragged weights and return `(weights, neighbors, offsets, max_degree)`."""
+function prepare_gpu_weights(backend, W::SpatialWeights, ::Type{T}, stat_code::Int32) where T
+    weights, neighbors, offsets = _gpu_csr_host(W, T, stat_code)
+    weights_gpu = KernelAbstractions.allocate(backend, T, max(1, length(weights)))
+    neighbors_gpu = KernelAbstractions.allocate(backend, Int32, max(1, length(neighbors)))
+    offsets_gpu = KernelAbstractions.allocate(backend, Int64, length(offsets))
+    !isempty(weights) && KernelAbstractions.copyto!(backend, weights_gpu, weights)
+    !isempty(neighbors) && KernelAbstractions.copyto!(backend, neighbors_gpu, neighbors)
+    KernelAbstractions.copyto!(backend, offsets_gpu, offsets)
+    return weights_gpu, neighbors_gpu, offsets_gpu, maximum(Int.(W.nneighs); init = 0)
+end
 
-        if k > 0 && p_start <= p_end
+@inline function _edge_at(start::Int64, slot::Int32, stat_code::Int32)
+    return start + Int64(slot - (stat_code == Int32(4) ? Int32(0) : Int32(1)))
+end
+
+@kernel function _local_perm_worker_kernel!(
+    partial_upper, partial_lower, partial_mean, partial_m2, partial_anchor, full_perms,
+    @Const(z), @Const(weights), @Const(neighbors), @Const(row_offsets),
+    @Const(exact_values), @Const(exact_weight_magnitudes), @Const(exact_weight_signs),
+    @Const(exact_observed), @Const(exact_defined), @Const(row_ids), global_scratch,
+    n::Int32, row_count::Int32, chunk_count::Int32, chunk_size::Int32, total_permutations::Int32,
+    chunk_first::Int32, scale::T, base_seed::UInt64, stat_code::Int32,
+    return_perms::Bool, use_global_scratch::Bool, scratch_stride::Int64,
+    ::Val{PRIVATE_K}, ::Val{EXACT_TAILS}
+) where {T, PRIVATE_K, EXACT_TAILS}
+    local_i, local_c = @index(Global, NTuple)
+    chosen = @private Int32 (PRIVATE_K,)
+    private_hash = @private Int32 (2 * PRIVATE_K,)
+    exact_acc = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    exact_term = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    exact_left = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    exact_right = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    exact_square = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    exact_observed_local = @private UInt32 (EXACT_TAILS ? 8 : 1,)
+    # KernelAbstractions already masks every ndrange dimension through
+    # __validindex; both guards are kept explicit so the two indices read
+    # symmetrically.
+    if local_i <= row_count && local_c <= chunk_count
+        i = row_ids[local_i]
+        k = unsafe_trunc(Int32, row_offsets[i + Int64(1)] - row_offsets[i])
+        stat_code == Int32(4) && (k -= Int32(1))
+        global_c = Int64(chunk_first) + Int64(local_c) - Int64(1)
+        p_start = _chunk_start_i64(global_c, Int64(chunk_size))
+        p_end = _chunk_end_i64(Int64(total_permutations), global_c, Int64(chunk_size))
+        row_start = row_offsets[i]
+        if p_start <= p_end
             zi = z[i]
-            s_obs = obs_stat[i]
-
-            larger_count = Int32(0)
-            sum_val = T(0)
-            sum_sq_val = T(0)
-
-            chosen = @private Int32 (MAX_K,)
-            state = base_seed + UInt64(i) * 0x9e3779b97f4a7c15 + UInt64(c) * 0x517cc1b727220a95
-
+            obs_lag = T(0); obs_abs_lag = T(0)
+            obs_geary_sum = T(0); obs_abs_geary_sum = T(0)
+            for slot in Int32(1):k
+                edge = _edge_at(row_start, slot, stat_code)
+                idx = neighbors[edge]; w = weights[edge]; zj = z[idx]
+                if stat_code == Int32(1) || stat_code == Int32(3) || stat_code == Int32(4)
+                    contribution = w * zj
+                    obs_lag += contribution; obs_abs_lag += abs(contribution)
+                elseif stat_code == Int32(2)
+                    diff = zi - zj; contribution = w * diff * diff
+                    obs_geary_sum += contribution; obs_abs_geary_sum += abs(contribution)
+                end
+            end
+            focal_weight = stat_code == Int32(4) ? weights[row_start] : T(0)
+            obs_cmp = stat_code == Int32(4) ? focal_weight * zi + obs_lag :
+                      stat_code == Int32(3) ? obs_lag :
+                      stat_code == Int32(1) ? (zi / scale) * obs_lag :
+                      stat_code == Int32(2) ? (T(1) / scale) * obs_geary_sum : T(0)
+            if EXACT_TAILS
+                _exact_zero!(exact_observed_local)
+                for limb in 1:8
+                    exact_observed_local[limb] = exact_observed[limb, i]
+                end
+            end
+            mean_val = T(0); m2_val = T(0); anchor = T(0)
+            upper_count = Int32(0); lower_count = Int32(0)
+            # RNG_KEY_OBSERVATION_PERMUTATION: every (observation, permutation)
+            # pair owns its stream, so seeded draws never depend on how
+            # permutations are chunked or batched across workers.
+            row_key = base_seed ⊻ (unsafe_trunc(UInt64, i) * 0x9e3779b97f4a7c15)
+            worker_linear = (Int64(local_i) - Int64(1)) * Int64(chunk_count) + Int64(local_c) - Int64(1)
+            scratch_base = worker_linear * scratch_stride
+            hash_capacity = use_global_scratch ? scratch_stride : Int64(2 * PRIVATE_K)
             for p in p_start:p_end
+                state, _ = splitmix64(row_key ⊻ (unsafe_trunc(UInt64, p) * 0x517cc1b727220a95))
                 num_sampled = Int32(0)
-                lag = T(0)
-                geary_sum = T(0)
-
+                lag = T(0); abs_lag = T(0); geary_sum = T(0); abs_geary_sum = T(0)
+                EXACT_TAILS && _exact_zero!(exact_acc)
+                if k > Int32(64)
+                    for slot in Int64(1):hash_capacity
+                        if use_global_scratch
+                            global_scratch[scratch_base + slot] = Int32(0)
+                        else
+                            private_hash[slot] = Int32(0)
+                        end
+                    end
+                end
                 while num_sampled < k
-                    idx, state = rand_index(state, n, Int32(i))
+                    idx, state = rand_index(state, n, i)
                     is_dup = false
-                    for prev in Int32(1):num_sampled
-                        if chosen[prev] == idx
-                            is_dup = true
-                            break
+                    if k <= Int32(64)
+                        for prev in Int32(1):num_sampled
+                            if chosen[prev] == idx
+                                is_dup = true; break
+                            end
+                        end
+                    else
+                        hash_slot = unsafe_trunc(Int64,
+                            (unsafe_trunc(UInt64, idx) * UInt64(0x9e3779b9)) &
+                            unsafe_trunc(UInt64, hash_capacity - Int64(1))) + Int64(1)
+                        while true
+                            stored = use_global_scratch ?
+                                global_scratch[scratch_base + hash_slot] : private_hash[hash_slot]
+                            if stored == Int32(0)
+                                if use_global_scratch
+                                    global_scratch[scratch_base + hash_slot] = idx
+                                else
+                                    private_hash[hash_slot] = idx
+                                    chosen[num_sampled + Int32(1)] = unsafe_trunc(Int32, hash_slot)
+                                end
+                                break
+                            elseif stored == idx
+                                is_dup = true; break
+                            end
+                            hash_slot = hash_slot == hash_capacity ? Int64(1) : hash_slot + Int64(1)
                         end
                     end
                     if !is_dup
                         num_sampled += Int32(1)
-                        chosen[num_sampled] = idx
-                        w = padded_weights[num_sampled, i]
-                        zj = z[idx]
+                        k <= Int32(64) && (chosen[num_sampled] = idx)
+                        edge = _edge_at(row_start, num_sampled, stat_code)
+                        w = weights[edge]; zj = z[idx]
                         if stat_code == Int32(1) || stat_code == Int32(3) || stat_code == Int32(4)
-                            lag += w * zj
+                            contribution = w * zj
+                            lag += contribution; abs_lag += abs(contribution)
                         elseif stat_code == Int32(2)
-                            diff = zi - zj
-                            geary_sum += w * diff * diff
+                            diff = zi - zj; contribution = w * diff * diff
+                            geary_sum += contribution; abs_geary_sum += abs(contribution)
+                        end
+                        if EXACT_TAILS
+                            if stat_code == Int32(2)
+                                _exact_load_value!(exact_left, exact_values, i)
+                                _exact_load_value!(exact_right, exact_values, idx)
+                                if _exact_unsigned_cmp96(exact_left, exact_right) < Int32(0)
+                                    _exact_sub96!(exact_term, exact_right, exact_left)
+                                else
+                                    _exact_sub96!(exact_term, exact_left, exact_right)
+                                end
+                                _exact_mul_3x3!(exact_square, exact_term, exact_term)
+                                _exact_load_weight!(exact_right, exact_weight_magnitudes, edge)
+                                _exact_mul_6x2!(exact_term, exact_square, exact_right)
+                            else
+                                _exact_load_value!(exact_left, exact_values, idx)
+                                _exact_load_weight!(exact_right, exact_weight_magnitudes, edge)
+                                _exact_mul_3x2!(exact_term, exact_left, exact_right)
+                            end
+                            if exact_weight_signs[edge] < Int8(0)
+                                _exact_negate!(exact_term)
+                            end
+                            _exact_add!(exact_acc, exact_acc, exact_term)
                         end
                     end
                 end
-
-                # Calculate permutation statistic based on stat_code:
-                # 1: Local Moran: (zi / m2) * lag
-                # 2: Local Geary: (1 / m2) * geary_sum
-                # 3: Getis-Ord Gi: lag / (denom - xi)
-                # 4: Getis-Ord Gi*: (wistar * xi + lag) / denom
-                s_perm = T(0)
-                if stat_code == Int32(1)
-                    s_perm = (zi / scale) * lag
-                elseif stat_code == Int32(2)
-                    s_perm = (T(1) / scale) * geary_sum
-                elseif stat_code == Int32(3)
-                    denom_minus_xi = scale - zi
-                    s_perm = lag / denom_minus_xi
-                elseif stat_code == Int32(4)
-                    # scale = denom, padded_weights contains wistar
-                    s_perm = (padded_weights[1, i] * zi + lag) / scale
+                s_perm = stat_code == Int32(4) ? focal_weight * zi + lag :
+                         stat_code == Int32(3) ? lag :
+                         stat_code == Int32(1) ? (zi / scale) * lag :
+                         stat_code == Int32(2) ? (T(1) / scale) * geary_sum : T(0)
+                obs_bound = stat_code == Int32(1) ? abs(zi / scale) * obs_abs_lag :
+                            stat_code == Int32(2) ? abs(T(1) / scale) * obs_abs_geary_sum :
+                            stat_code == Int32(4) ? abs(focal_weight * zi) + obs_abs_lag : obs_abs_lag
+                perm_bound = stat_code == Int32(1) ? abs(zi / scale) * abs_lag :
+                             stat_code == Int32(2) ? abs(T(1) / scale) * abs_geary_sum :
+                             stat_code == Int32(4) ? abs(focal_weight * zi) + abs_lag : abs_lag
+                tol = T(4) * eps(T) * (T(k) + T(2)) * (obs_bound + perm_bound)
+                if EXACT_TAILS && exact_defined[i]
+                    cmp = _exact_signed_cmp(exact_acc, exact_observed_local)
+                    cmp >= Int32(0) && (upper_count += Int32(1))
+                    cmp <= Int32(0) && (lower_count += Int32(1))
+                else
+                    delta_cmp = s_perm - obs_cmp
+                    delta_cmp >= -tol && (upper_count += Int32(1))
+                    delta_cmp <= tol && (lower_count += Int32(1))
                 end
-
-                if s_perm >= s_obs
-                    larger_count += Int32(1)
-                end
-                sum_val += s_perm
-                sum_sq_val += s_perm * s_perm
-
                 if return_perms
-                    full_perms[i, p] = s_perm
+                    permutation_offset = (Int64(chunk_first) - Int64(1)) * Int64(chunk_size)
+                    full_perms[local_i, p - permutation_offset] = s_perm
                 end
+                p == p_start && (anchor = s_perm)
+                centered = s_perm - anchor
+                count = p - p_start + Int64(1)
+                delta = centered - mean_val
+                mean_val += delta / T(count)
+                delta2 = centered - mean_val
+                m2_val += delta * delta2
             end
-
-            partial_larger[i, c] = larger_count
-            partial_sum[i, c] = sum_val
-            partial_sum_sq[i, c] = sum_sq_val
+            partial_upper[local_i, local_c] = upper_count
+            partial_lower[local_i, local_c] = lower_count
+            partial_mean[local_i, local_c] = mean_val
+            partial_m2[local_i, local_c] = m2_val
+            partial_anchor[local_i, local_c] = anchor
         end
     end
 end
 
+# Compatibility adapter for exact-tail helper tests. It invokes the same worker
+# kernel in private mode; production uses the richer batched launcher.
+function local_perm_chunk_kernel!(backend, groupsize)
+    worker_kernel = _local_perm_worker_kernel!(backend, groupsize)
+    return function (partial_upper, partial_lower, partial_mean, partial_m2, partial_anchor,
+                    full_perms, z, weights, neighbors, row_offsets, exact_values,
+                    exact_weight_magnitudes, exact_weight_signs, exact_observed,
+                    exact_defined, n, chunk_size, total_permutations, scale, base_seed,
+                    stat_code, return_perms, private_val, exact_val; ndrange)
+        nrows = ndrange isa Tuple ? Int(ndrange[1]) : Int(ndrange)
+        nchunks = ndrange isa Tuple ? Int(ndrange[2]) : 1
+        row_ids = collect(Int32, 1:nrows)
+        dummy_scratch = KernelAbstractions.zeros(backend, Int32, 1)
+        worker_kernel(partial_upper, partial_lower, partial_mean, partial_m2, partial_anchor,
+                      full_perms, z, weights, neighbors, row_offsets,
+                      exact_values, exact_weight_magnitudes, exact_weight_signs,
+                      exact_observed, exact_defined, row_ids, dummy_scratch,
+                      Int32(n), Int32(nrows), Int32(nchunks), Int32(chunk_size), Int32(total_permutations),
+                      Int32(1), scale, base_seed, stat_code, return_perms, false,
+                      Int64(1), private_val, exact_val; ndrange = ndrange)
+    end
+end
+
+local_perm_chunk_kernel!(backend) = local_perm_chunk_kernel!(backend, 1)
+
+function _degree_bucket(k::Int)
+    k <= _GPU_PRIVATE_CROSSOVER && return max(16, nextpow(2, max(k, 1)))
+    bucket = 1
+    while bucket < k
+        bucket <= typemax(Int) ÷ 2 || throw(ArgumentError("neighbor degree bucket overflows host size arithmetic"))
+        bucket *= 2
+    end
+    return bucket
+end
+
+@inline function _merge_chunk!(mean_all, m2_all, count_all, row, chunk_mean, chunk_m2, chunk_count)
+    if count_all[row] == 0
+        mean_all[row] = chunk_mean; m2_all[row] = chunk_m2; count_all[row] = chunk_count
+    else
+        delta = chunk_mean - mean_all[row]
+        total = count_all[row] + chunk_count
+        mean_all[row] += delta * (chunk_count / total)
+        m2_all[row] += chunk_m2 + delta * delta * (count_all[row] * chunk_count / total)
+        count_all[row] = total
+    end
+end
+
+function _upload_row_ids(backend, rows::Vector{Int})
+    ids = Int32.(rows)
+    gpu = KernelAbstractions.allocate(backend, Int32, length(ids))
+    KernelAbstractions.copyto!(backend, gpu, ids)
+    return gpu
+end
+
+function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
+                      data_gpu, weights_gpu, neighbors_gpu, offsets_gpu,
+                      exact_values_gpu, exact_weight_magnitudes_gpu, exact_weight_signs_gpu,
+                      exact_observed_gpu, exact_defined_gpu, n::Int, permutations::Int,
+                      chunk_size::Int, num_chunks::Int, base_seed::UInt64, stat_code::Int32,
+                      return_perms::Bool, exact_tails::Bool, kernel_scale, total_upper,
+                      total_lower, means, m2s, counts, retained, scratch_budget::Int)
+    use_global = bucket > _GPU_PRIVATE_CROSSOVER
+    scratch_stride = use_global ? Int64(2) * Int64(bucket) : Int64(1)
+    bytes_per_worker = use_global ? scratch_stride * Int64(sizeof(Int32)) : Int64(1)
+    max_workers = max(Int64(1), Int64(scratch_budget) ÷ bytes_per_worker)
+    row_pos = 1; chunk_first = 1
+    while chunk_first <= num_chunks
+        chunk_count = Int(min(num_chunks - chunk_first + 1, max_workers))
+        rows_per_batch = Int(max(Int64(1), max_workers ÷ Int64(chunk_count)))
+        while row_pos <= length(rows)
+            last_row = min(length(rows), row_pos + rows_per_batch - 1)
+            row_batch = rows[row_pos:last_row]
+            nrows = length(row_batch)
+            workers = Int64(nrows) * Int64(chunk_count)
+            workers <= max_workers || throw(ArgumentError("internal GPU scratch batch exceeds its checked budget"))
+            ids_gpu = _upload_row_ids(backend, row_batch)
+            worker_scratch = if use_global
+                total_slots = workers * scratch_stride
+                total_slots <= typemax(Int) || throw(ArgumentError("GPU scratch allocation exceeds host addressable storage"))
+                KernelAbstractions.zeros(backend, Int32, Int(total_slots))
+            else
+                KernelAbstractions.zeros(backend, Int32, 1)
+            end
+            span_start = (chunk_first - 1) * chunk_size + 1
+            span_end = min(permutations, (chunk_first + chunk_count - 1) * chunk_size)
+            span = span_end - span_start + 1
+            batch_upper = KernelAbstractions.zeros(backend, Int32, nrows, chunk_count)
+            batch_lower = KernelAbstractions.zeros(backend, Int32, nrows, chunk_count)
+            batch_mean = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
+            batch_m2 = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
+            batch_anchor = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
+            batch_perms = return_perms ? KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, span) :
+                         KernelAbstractions.zeros(backend, eltype(data_gpu), 0, 0)
+            worker_kernel(batch_upper, batch_lower, batch_mean, batch_m2, batch_anchor,
+                          batch_perms, data_gpu, weights_gpu, neighbors_gpu, offsets_gpu,
+                      exact_values_gpu, exact_weight_magnitudes_gpu,
+                          exact_weight_signs_gpu, exact_observed_gpu, exact_defined_gpu,
+                          ids_gpu, worker_scratch, _checked_i32(n, "number of observations"),
+                          _checked_i32(nrows, "logical worker row batch"),
+                          _checked_i32(chunk_count, "logical worker chunk batch"),
+                          _checked_i32(chunk_size, "permutation chunk size"),
+                          _checked_i32(permutations, "permutation count"),
+                          _checked_i32(chunk_first, "chunk identity"), kernel_scale, base_seed,
+                          stat_code, return_perms, use_global, scratch_stride,
+                          Val(use_global ? _GPU_PRIVATE_CROSSOVER : bucket), Val(exact_tails);
+                          ndrange = (nrows, chunk_count))
+            KernelAbstractions.synchronize(backend)
+            hu = Array(batch_upper); hl = Array(batch_lower)
+            hm = Array(batch_mean); hq = Array(batch_m2); ha = Array(batch_anchor)
+            hp = return_perms ? Array(batch_perms) : nothing
+            for (local_row, row) in enumerate(row_batch)
+                for local_chunk in 1:chunk_count
+                    total_upper[row] += Int64(hu[local_row, local_chunk])
+                    total_lower[row] += Int64(hl[local_row, local_chunk])
+                    chunk_n = min(permutations, (chunk_first + local_chunk - 1) * chunk_size) -
+                              (chunk_first + local_chunk - 2) * chunk_size
+                    chunk_mean = Float64(ha[local_row, local_chunk]) + Float64(hm[local_row, local_chunk])
+                    _merge_chunk!(means, m2s, counts, row, chunk_mean,
+                                  Float64(hq[local_row, local_chunk]), chunk_n)
+                end
+                if return_perms
+                    for local_p in 1:span
+                        retained[row, span_start + local_p - 1] = Float64(hp[local_row, local_p])
+                    end
+                end
+            end
+            row_pos = last_row + 1
+        end
+        row_pos = 1
+        chunk_first += chunk_count
+    end
+    return nothing
+end
+
 function SpatialDependence.crand_local_gpu(
-    backend,
-    stat_type::Symbol,
-    permutations::Int,
-    data::AbstractVector,
-    W::SpatialWeights,
-    obs_stat::AbstractVector,
-    scale_param::Number;
-    return_perms::Bool = true,
-    seed::Union{Integer, Nothing} = nothing
-)
-    # Automatically resolve backend = :gpu if a GPU package is loaded
+    backend, stat_type::Symbol, permutations::Int, data::AbstractVector,
+    W::SpatialWeights, obs_stat::AbstractVector, scale_param::Number;
+    return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing,
+    rng::AbstractRNG = default_rng(), precision = nothing,
+    comparison_data::Union{Nothing, AbstractVector} = nothing)
+    permutations >= 0 || throw(ArgumentError("permutations must be nonnegative"))
+    length(data) == length(obs_stat) || throw(ArgumentError("data and observed statistic lengths must match"))
+    SpatialDependence._validate_local_precision(backend, precision)
+    validated_seed = SpatialDependence._validate_local_seed(seed)
     actual_backend = if backend === :gpu
-        found = nothing
-        for (modkey, mod) in Base.loaded_modules
-            if modkey.name == "Metal" && isdefined(mod, :MetalBackend)
-                found = mod.MetalBackend()
-                break
-            elseif modkey.name == "CUDA" && isdefined(mod, :CUDABackend)
-                found = mod.CUDABackend()
-                break
-            elseif modkey.name == "AMDGPU" && isdefined(mod, :ROCBackend)
-                found = mod.ROCBackend()
-                break
+        candidates = Tuple{Symbol, Any}[]
+        for (vendor, constructor) in ((:Metal, :MetalBackend), (:CUDA, :CUDABackend),
+                                      (:AMDGPU, :ROCBackend), (:oneAPI, :oneAPIBackend))
+            for (modkey, mod) in Base.loaded_modules
+                modkey.name == String(vendor) || continue
+                isdefined(mod, constructor) && isdefined(mod, :functional) || continue
+                functional = try mod.functional() catch; false end
+                functional || continue
+                if vendor == :AMDGPU
+                    isdefined(mod, :has_rocm_gpu) || continue
+                    (try mod.has_rocm_gpu() catch; false end) || continue
+                end
+                candidate = try getfield(mod, constructor)() catch; nothing end
+                candidate === nothing || push!(candidates, (vendor, candidate))
             end
         end
-        if found === nothing
-            throw(ArgumentError("backend=:gpu specified, but no loaded GPU backend was found. Please run `using Metal` (for Mac) or `using CUDA` (for NVIDIA) before calling."))
-        end
-        found
+        isempty(candidates) && throw(ArgumentError("backend=:gpu specified, but no loaded GPU backend was found. Please run `using Metal` (for Mac) or `using CUDA` (for NVIDIA) before calling."))
+        length(candidates) == 1 || throw(ArgumentError("backend=:gpu is ambiguous; loaded functional GPU backends: " * join(string.(first.(candidates)), ", ")))
+        last(candidates)[2]
     else
         backend
     end
-
     n = length(data)
-    T = Float32
-    
-    # Map stat_type to code
-    stat_code = if stat_type == :moran
-        Int32(1)
-    elseif stat_type == :geary
-        Int32(2)
-    elseif stat_type == :getisord
-        Int32(3)
-    elseif stat_type == :getisord_star
-        Int32(4)
-    else
-        throw(ArgumentError("Unknown stat_type $stat_type"))
+    W.n == n || throw(ArgumentError("data length must match the number of observations in W"))
+    _checked_i32(n, "number of observations")
+    has_float64_trait = isdefined(KernelAbstractions, :supports_float64)
+    backend_supports_float64 = has_float64_trait ? (try KernelAbstractions.supports_float64(actual_backend) catch; false end) : false
+    precision === Float64 && !backend_supports_float64 && throw(ArgumentError("precision=Float64 is not supported by backend $(typeof(actual_backend)); use precision=Float32 or a backend with Float64 support"))
+    T = precision === Float64 ? Float64 : Float32
+    stat_code = stat_type == :moran ? Int32(1) : stat_type == :geary ? Int32(2) :
+                stat_type == :getisord ? Int32(3) : stat_type == :getisord_star ? Int32(4) :
+                throw(ArgumentError("Unknown stat_type $stat_type"))
+    if permutations == 0
+        Iperms = return_perms ? Matrix{Float64}(undef, n, 0) : Matrix{Float64}(undef, 0, 0)
+        return Iperms, ones(Float64, n), fill(NaN, n), fill(NaN, n), fill(NaN, n)
     end
-
-    # Dynamic tuning for 2D chunking
-    num_chunks = Int(min(64, cld(permutations, 64)))
-    chunk_size = Int(cld(permutations, num_chunks))
-
-    # Prepare GPU data
-    padded_weights_gpu, cardinalities_gpu, max_k = prepare_gpu_weights(actual_backend, W, T, stat_code)
-    
-    data_gpu = KernelAbstractions.allocate(actual_backend, T, n)
-    KernelAbstractions.copyto!(actual_backend, data_gpu, T.(data))
-
-    obs_stat_gpu = KernelAbstractions.allocate(actual_backend, T, n)
-    KernelAbstractions.copyto!(actual_backend, obs_stat_gpu, T.(obs_stat))
-
-    partial_larger_gpu = KernelAbstractions.zeros(actual_backend, Int32, n, num_chunks)
-    partial_sum_gpu = KernelAbstractions.zeros(actual_backend, T, n, num_chunks)
-    partial_sum_sq_gpu = KernelAbstractions.zeros(actual_backend, T, n, num_chunks)
-
-    full_perms_gpu = if return_perms
-        KernelAbstractions.zeros(actual_backend, T, n, permutations)
-    else
-        KernelAbstractions.zeros(actual_backend, T, 0, 0)
-    end
-
-    base_seed = seed === nothing ? UInt64(time_ns()) : UInt64(seed)
-
-    # Dispatch compile-time MAX_K capacity
-    val_k = if max_k <= 16
-        Val(16)
-    elseif max_k <= 32
-        Val(32)
-    elseif max_k <= 64
-        Val(64)
-    elseif max_k <= 128
-        Val(128)
-    else
-        Val(256)
-    end
-
-    kernel! = local_perm_chunk_kernel!(actual_backend)
-    kernel!(
-        partial_larger_gpu, partial_sum_gpu, partial_sum_sq_gpu, full_perms_gpu,
-        data_gpu, obs_stat_gpu, padded_weights_gpu, cardinalities_gpu,
-        Int32(n), Int32(chunk_size), Int32(permutations), T(scale_param), base_seed,
-        stat_code, return_perms, val_k,
-        ndrange=(n, num_chunks)
-    )
-    KernelAbstractions.synchronize(actual_backend)
-
-    # Download summary vectors to host
-    h_larger = Array(partial_larger_gpu)
-    h_sum = Array(partial_sum_gpu)
-    h_sum_sq = Array(partial_sum_sq_gpu)
-
-    total_larger = vec(sum(h_larger, dims=2))
-    total_sum = vec(sum(h_sum, dims=2))
-    total_sum_sq = vec(sum(h_sum_sq, dims=2))
-
-    # Two-sided pseudo p-value
-    larger_twosided = copy(total_larger)
-    for i in 1:n
-        low = (permutations - larger_twosided[i])
-        if low < larger_twosided[i]
-            larger_twosided[i] = low
+    _checked_i32(permutations, "permutation count")
+    max_k = maximum(Int.(W.nneighs); init = 0)
+    max_k <= n - 1 || throw(ArgumentError("accelerated permutation sampling requires at most n-1 neighbors per observation"))
+    # Hoisted above payload construction so Float32 and Float64 reject the same
+    # graphs, and so nothing indexes a malformed W before it has been checked.
+    _validate_weights_structure(W, n)
+    exact_tails = T === Float32
+    comparison_source = comparison_data === nothing ? data : comparison_data
+    exact_payload = exact_tails ? _exact_tail_payload(comparison_source, W; stat_code=Int(stat_code)) : nothing
+    if exact_tails
+        any_defined = any(exact_payload.defined)
+        if stat_code == Int32(1) || stat_code == Int32(2)
+            any_defined && (!isfinite(Float64(scale_param)) || Float64(scale_param) <= 0.0) && throw(ArgumentError("exact accelerated tails require a finite positive Moran/Geary moment scale for nonconstant data"))
+            for i in 1:n
+                exact_payload.defined[i] || continue
+                isfinite(Float64(obs_stat[i])) || throw(ArgumentError("exact accelerated Moran/Geary tails require finite observed scores on defined rows"))
+            end
+        elseif any_defined
+            isfinite(Float64(scale_param)) || throw(ArgumentError("exact accelerated Getis tails require a finite denominator"))
+            for i in 1:n
+                exact_payload.defined[i] || continue
+                isfinite(Float64(obs_stat[i])) || throw(ArgumentError("exact accelerated Getis tails require finite observed scores on defined rows"))
+            end
         end
     end
-    p_values = (Float64.(larger_twosided) .+ 1.0) ./ (permutations + 1)
-
-    perms_mean = Float64.(total_sum) ./ permutations
-    perms_var = max.(0.0, (Float64.(total_sum_sq) ./ permutations) .- perms_mean.^2)
-    perms_std = sqrt.(perms_var)
-    zval = (Float64.(obs_stat) .- perms_mean) ./ perms_std
-
-    Iperms = if return_perms
-        Float64.(Array(full_perms_gpu))
-    else
-        Matrix{Float64}(undef, 0, 0)
+    num_chunks = _GPU_CHUNK_COUNT_OVERRIDE[] > 0 ?
+                 min(_GPU_CHUNK_COUNT_OVERRIDE[], permutations) :
+                 min(64, cld(permutations, 64))
+    chunk_size = cld(permutations, num_chunks)
+    num_chunks = cld(permutations, chunk_size)  # drop chunks the rounding left empty
+    centered_getis = stat_code == Int32(3) || stat_code == Int32(4)
+    data64 = Float64.(data)
+    getis_center = centered_getis ? mean(data64) : 0.0
+    getis_scale = centered_getis ? max(maximum(abs.(data64 .- getis_center)), 1.0) : 1.0
+    kernel_data = centered_getis ? (data64 .- getis_center) ./ getis_scale : data64
+    kernel_scale = Float64(scale_param)
+    if !centered_getis && isfinite(kernel_scale) && kernel_scale > 0.0
+        kernel_data ./= sqrt(kernel_scale); kernel_scale = 1.0
+    elseif centered_getis
+        kernel_scale = 1.0
     end
-
-    return Iperms, p_values, perms_mean, perms_std, zval
+    weights_gpu, neighbors_gpu, offsets_gpu, _ = prepare_gpu_weights(actual_backend, W, T, stat_code)
+    data_gpu = KernelAbstractions.allocate(actual_backend, T, n)
+    KernelAbstractions.copyto!(actual_backend, data_gpu, T.(kernel_data))
+    exact_values_gpu, exact_weight_magnitudes_gpu, exact_weight_signs_gpu,
+    exact_observed_gpu, exact_defined_gpu = if exact_tails
+        v = KernelAbstractions.allocate(actual_backend, UInt32, size(exact_payload.values.values)...)
+        wm = KernelAbstractions.allocate(actual_backend, UInt32, size(exact_payload.weights.magnitudes)...)
+        ws = KernelAbstractions.allocate(actual_backend, Int8, length(exact_payload.weights.signs))
+        o = KernelAbstractions.allocate(actual_backend, UInt32, size(exact_payload.observed)...)
+        d = KernelAbstractions.allocate(actual_backend, Bool, n)
+        KernelAbstractions.copyto!(actual_backend, v, exact_payload.values.values)
+        KernelAbstractions.copyto!(actual_backend, wm, exact_payload.weights.magnitudes)
+        KernelAbstractions.copyto!(actual_backend, ws, exact_payload.weights.signs)
+        KernelAbstractions.copyto!(actual_backend, o, exact_payload.observed)
+        KernelAbstractions.copyto!(actual_backend, d, collect(exact_payload.defined))
+        (v, wm, ws, o, d)
+    else
+        (KernelAbstractions.zeros(actual_backend, UInt32, 1, 1), KernelAbstractions.zeros(actual_backend, UInt32, 2, 1),
+         KernelAbstractions.zeros(actual_backend, Int8, 1), KernelAbstractions.zeros(actual_backend, UInt32, 8, 1),
+         KernelAbstractions.zeros(actual_backend, Bool, 1))
+    end
+    compare_sign_cpu = ones(Int32, n); getis_offset = zeros(Float64, n); getis_factor = zeros(Float64, n)
+    if centered_getis
+        wt = wtransformation(W); total = Float64(scale_param)
+        for i in 1:n
+            k = Int(W.nneighs[i])
+            wistar = stat_code == Int32(4) && wt == :row ? 1.0 / (k + 1) : 1.0
+            weight_sum = stat_code == Int32(4) ? (k + 1) * wistar : sum(W.weights[i])
+            denominator = stat_code == Int32(4) ? total : total - data64[i]
+            getis_offset[i] = getis_center * weight_sum / denominator
+            getis_factor[i] = getis_scale / denominator
+            compare_sign_cpu[i] = getis_factor[i] < 0.0 ? Int32(-1) : Int32(1)
+        end
+    end
+    total_upper = zeros(Int64, n); total_lower = zeros(Int64, n)
+    means = zeros(Float64, n); m2s = zeros(Float64, n); counts = zeros(Int, n)
+    retained = return_perms ? Matrix{Float64}(undef, n, permutations) : Matrix{Float64}(undef, 0, permutations)
+    base_seed = validated_seed === nothing ? rand(rng, UInt64) : validated_seed
+    rows_by_bucket = Dict{Int, Vector{Int}}()
+    for i in 1:n
+        bucket = _degree_bucket(Int(W.nneighs[i]))
+        push!(get!(rows_by_bucket, bucket, Int[]), i)
+    end
+    worker_kernel = _local_perm_worker_kernel!(actual_backend)
+    for bucket in sort!(collect(keys(rows_by_bucket)))
+        _run_bucket!(actual_backend, worker_kernel, rows_by_bucket[bucket], bucket,
+                     data_gpu, weights_gpu, neighbors_gpu, offsets_gpu,
+                     exact_values_gpu, exact_weight_magnitudes_gpu, exact_weight_signs_gpu,
+                     exact_observed_gpu, exact_defined_gpu, n, permutations, chunk_size,
+                     num_chunks, base_seed, stat_code, return_perms, exact_tails,
+                     T(kernel_scale), total_upper, total_lower, means, m2s, counts,
+                     retained, _GPU_SCRATCH_BUDGET[])
+    end
+    p_values = (Float64.(min.(total_upper, total_lower)) .+ 1.0) ./ (permutations + 1.0)
+    p_values[W.nneighs .== 0] .= 1.0
+    exact_tails && (p_values[.!exact_payload.defined] .= 1.0)
+    varying_mean = means; varying_std = sqrt.(max.(0.0, m2s ./ permutations))
+    perms_mean = copy(varying_mean); perms_std = copy(varying_std)
+    if centered_getis
+        perms_mean = getis_offset .+ getis_factor .* varying_mean
+        perms_std = abs.(getis_factor) .* varying_std
+    end
+    invalid_summary = .!isfinite.(perms_mean) .| .!isfinite.(perms_std)
+    if exact_tails
+        p_values[invalid_summary .& .!exact_payload.defined] .= 1.0
+    else
+        p_values[invalid_summary] .= 1.0
+    end
+    if centered_getis
+        observed_varying = zeros(Float64, n); wt = wtransformation(W)
+        for i in 1:n
+            yi = kernel_data[i]; neigh = W.neighs[i]
+            if stat_code == Int32(4)
+                wistar = wt == :row ? 1.0 / (length(neigh) + 1) : 1.0
+                observed_varying[i] = wistar * yi + sum((wistar * kernel_data[j] for j in neigh); init=0.0)
+            else
+                observed_varying[i] = sum((W.weights[i][j] * kernel_data[neigh[j]] for j in eachindex(neigh)); init=0.0)
+            end
+        end
+        zval = compare_sign_cpu .* (observed_varying .- varying_mean) ./ varying_std
+        zval[varying_std .== 0.0] .= NaN
+    else
+        zval = (Float64.(obs_stat) .- perms_mean) ./ perms_std
+        zval[perms_std .== 0.0] .= NaN
+    end
+    if return_perms && centered_getis
+        for i in 1:n
+            retained[i, :] .= getis_offset[i] .+ getis_factor[i] .* retained[i, :]
+        end
+    end
+    return retained, p_values, perms_mean, perms_std, zval
 end
 
 end # module
