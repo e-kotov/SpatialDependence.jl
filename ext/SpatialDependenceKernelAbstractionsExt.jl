@@ -27,8 +27,9 @@ Internal test hook; deliberately not part of the public keyword API.
 `0` restores the default rule.  Streams are keyed by (observation, permutation)
 and moments are accumulated in blocks of the global permutation index, so the
 chunk count only decides how permutations are spread over workers: it cannot
-change any returned value.  Requested counts are rounded to whole moment blocks
-and renormalised, so the effective count may differ from the one passed here.
+change any returned value.  Chunk sizes are rounded down to whole moment blocks
+and the count renormalised, so the effective count may differ from (and is
+usually at least) the one passed here.
 """
 function _set_gpu_chunk_count!(chunks::Integer)
     chunks >= 0 || throw(ArgumentError("GPU chunk count override must be nonnegative"))
@@ -631,11 +632,15 @@ function SpatialDependence.crand_local_gpu(
     num_chunks = _GPU_CHUNK_COUNT_OVERRIDE[] > 0 ?
                  min(_GPU_CHUNK_COUNT_OVERRIDE[], permutations) :
                  min(64, cld(permutations, 64))
-    # Round chunks up to whole moment blocks so every block is produced by one
-    # worker; a chunk that already covers the whole run needs no padding, and
-    # clamping it keeps `chunk_size` inside the device Int32 domain.
+    # Chunks are whole moment blocks so every block is produced by one worker.
+    # The block count per chunk is rounded down, never up: rounding up would
+    # leave fewer chunks than the rule asked for (40 instead of 64 at
+    # P = 9,999), which starves small problems of device threads.  A chunk that
+    # covers the whole run needs no alignment, and clamping it keeps
+    # `chunk_size` inside the device Int32 domain.
     moment_block = _moment_block(permutations)
-    chunk_size = min(permutations, moment_block * cld(cld(permutations, num_chunks), moment_block))
+    chunk_size = min(permutations,
+                     moment_block * max(1, fld(cld(permutations, moment_block), num_chunks)))
     num_chunks = cld(permutations, chunk_size)  # drop chunks the rounding left empty
     centered_getis = stat_code == Int32(3) || stat_code == Int32(4)
     data64 = Float64.(data)

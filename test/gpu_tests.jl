@@ -533,11 +533,22 @@ end
         # count changes nothing at all: draws, p-values and the summaries are
         # bit-identical.  `isequal` rather than `==` because z-scores are NaN
         # on zero-variance rows.
-        assert_chunk_invariant = function (run, Z, y, P, chunk_counts)
+        # `budget` additionally shrinks the scratch budget for the rechunked
+        # runs only, which forces one worker per launch: the host then merges
+        # blocks across many launches and row batches, so the merge order is
+        # compared with the default run's single launch.
+        assert_chunk_invariant = function (run, Z, y, P, chunk_counts; budget = nothing)
             GPU_EXTENSION._set_gpu_chunk_count!(0)
             default = run(y, Z; permutations = P, backend = backend, seed = 31)
             default_streamed = run(y, Z; permutations = P, backend = backend, seed = 31,
                                    return_perms = false)
+            # Keeping the draws must not change the summaries either.
+            @test isequal(mean(default_streamed), mean(default))
+            @test isequal(std(default_streamed), std(default))
+            @test isequal(zscore(default_streamed), zscore(default))
+            old_budget = budget === nothing ? nothing :
+                         GPU_EXTENSION._set_gpu_scratch_budget!(budget)
+            try
             for chunks in chunk_counts
                 GPU_EXTENSION._set_gpu_chunk_count!(chunks)
                 rechunked = run(y, Z; permutations = P, backend = backend, seed = 31)
@@ -549,17 +560,20 @@ end
                 streamed = run(y, Z; permutations = P, backend = backend, seed = 31,
                                return_perms = false)
                 @test pvalue(streamed) == pvalue(default)
-                @test isequal(mean(streamed), mean(default_streamed))
-                @test isequal(std(streamed), std(default_streamed))
-                @test isequal(zscore(streamed), zscore(default_streamed))
+                @test isequal(mean(streamed), mean(default))
+                @test isequal(std(streamed), std(default))
+                @test isequal(zscore(streamed), zscore(default))
+            end
+            finally
+                old_budget === nothing || GPU_EXTENSION._set_gpu_scratch_budget!(old_budget)
             end
         end
         old_chunks = GPU_EXTENSION._set_gpu_chunk_count!(0)
         try
-            # At P = 130 the 64-permutation block admits only three distinct
-            # schedules (chunk sizes 130, 128 and 64); the requested counts
-            # above 2 all renormalise to 3 chunks.  The last block is partial
-            # here, 130 = 2 * 64 + 2.
+            # At P = 130 there are three 64-permutation blocks, the last one
+            # partial (130 = 2 * 64 + 2).  Chunk sizes round down to whole
+            # blocks, so a request of 1 gives one chunk and every larger request
+            # gives three; the default rule also gives three.
             @test GPU_EXTENSION._moment_block(130) == 64
             for run in runners
                 assert_chunk_invariant(run, Wmixed, y, 130, (1, 2, 7, 64, 129, 130, 1000))
@@ -567,14 +581,20 @@ end
             # P above 8192 selects a moment block longer than 64, on a graph
             # small enough to keep the run cheap.  None of these chunk counts
             # divides P, and they straddle the rounding to whole blocks: with a
-            # 256-permutation block the requested 3, 7 and 97 become 3, 7 and
-            # 79 chunks, against 40 for the default rule.
+            # 256-permutation block (79 blocks) the requested 3, 7 and 97 become
+            # 4, 8 and 79 chunks of 26, 11 and 1 blocks; the default rule gives 79.
             ntiny = 8
             Wtiny = mixed_degree_weights(ntiny, ntiny - 1)
             ytiny = Float64.(mod.(collect(1:ntiny), 5))
             @test GPU_EXTENSION._moment_block(20000) == 256
             for run in runners
                 assert_chunk_invariant(run, Wtiny, ytiny, 20000, (3, 7, 97))
+            end
+            # Two-block chunks (a request of 39) with one worker per launch:
+            # merging the blocks of a span in any other order than the global
+            # permutation order changes the last bits of the moments.
+            for run in runners
+                assert_chunk_invariant(run, Wtiny, ytiny, 20000, (39,); budget = 1)
             end
         finally
             GPU_EXTENSION._set_gpu_chunk_count!(old_chunks)
