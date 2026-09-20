@@ -273,7 +273,10 @@ function worker_chunk_boundary_probe(backend)
     kernel(upper, lower, means, m2s, anchors, perms, z, weights, neighbors, offsets,
            exact_values, exact_weight_magnitudes, exact_weight_signs, exact_observed,
            exact_defined, row_ids, scratch, Int32(2), Int32(1), Int32(1), chunk_size,
-           total, Int32(2), Float32(1), UInt64(7), Int32(1), true, false, Int64(1),
+           total, Int32(2), Float32(1), UInt64(7), Int32(1), true, false,
+           # One moment block per chunk, so the 1x1 moment buffers stay valid
+           # while the probe pushes the permutation index to the Int32 ceiling.
+           (Int64(1), Int64(chunk_size)),
            Val(16), Val(false); ndrange = (1, 1))
     KernelAbstractions.synchronize(backend)
     return Array(upper), Array(lower), Array(perms)
@@ -285,7 +288,7 @@ function worker_ir_types(exact_tails::Bool)
             Vector{Int32}, Vector{Int64}, Matrix{UInt32}, Matrix{UInt32},
             Vector{Int8}, Matrix{UInt32}, Vector{Bool}, Vector{Int32}, Vector{Int32},
             Int32, Int32, Int32, Int32, Int32, Int32, Float32, UInt64, Int32,
-            Bool, Bool, Int64, Val{16})
+            Bool, Bool, NTuple{2, Int64}, Val{16})
     return exact_tails ? Tuple{base..., Val{true}} : Tuple{base..., Val{false}}
 end
 
@@ -315,6 +318,9 @@ backends = VENDOR_BACKEND === nothing ? (nothing, CPU()) : (nothing, CPU(), VEND
             ir = KernelAbstractions.ka_code_typed(
                 kernel, worker_ir_types(exact_tails);
                 ndrange = (1, 1), optimize = true)
+            # A signature that no longer matches the kernel yields no IR at
+            # all, which would make the check below pass vacuously.
+            @test !isempty(ir)
             text = join(sprint(show, item) for item in ir)
             @test !occursin("throw_inexacterror", text)
         end
@@ -522,24 +528,53 @@ end
                    (y, Z; kwargs...) -> localgeary(y, Z; kwargs...),
                    (y, Z; kwargs...) -> getisord(y, Z, star = false; kwargs...),
                    (y, Z; kwargs...) -> getisord(y, Z, star = true; kwargs...))
+        # Streams are keyed by (observation, permutation) and moments are
+        # accumulated in blocks of the global permutation index, so the chunk
+        # count changes nothing at all: draws, p-values and the summaries are
+        # bit-identical.  `isequal` rather than `==` because z-scores are NaN
+        # on zero-variance rows.
+        assert_chunk_invariant = function (run, Z, y, P, chunk_counts)
+            GPU_EXTENSION._set_gpu_chunk_count!(0)
+            default = run(y, Z; permutations = P, backend = backend, seed = 31)
+            default_streamed = run(y, Z; permutations = P, backend = backend, seed = 31,
+                                   return_perms = false)
+            for chunks in chunk_counts
+                GPU_EXTENSION._set_gpu_chunk_count!(chunks)
+                rechunked = run(y, Z; permutations = P, backend = backend, seed = 31)
+                @test scoreperms(rechunked) == scoreperms(default)
+                @test pvalue(rechunked) == pvalue(default)
+                @test isequal(mean(rechunked), mean(default))
+                @test isequal(std(rechunked), std(default))
+                @test isequal(zscore(rechunked), zscore(default))
+                streamed = run(y, Z; permutations = P, backend = backend, seed = 31,
+                               return_perms = false)
+                @test pvalue(streamed) == pvalue(default)
+                @test isequal(mean(streamed), mean(default_streamed))
+                @test isequal(std(streamed), std(default_streamed))
+                @test isequal(zscore(streamed), zscore(default_streamed))
+            end
+        end
         old_chunks = GPU_EXTENSION._set_gpu_chunk_count!(0)
         try
+            # At P = 130 the 64-permutation block admits only three distinct
+            # schedules (chunk sizes 130, 128 and 64); the requested counts
+            # above 2 all renormalise to 3 chunks.  The last block is partial
+            # here, 130 = 2 * 64 + 2.
+            @test GPU_EXTENSION._moment_block(130) == 64
             for run in runners
-                GPU_EXTENSION._set_gpu_chunk_count!(0)
-                default = run(y, Wmixed; permutations = 130, backend = backend, seed = 31)
-                for chunks in (1, 2, 7, 64, 129, 130, 1000)
-                    GPU_EXTENSION._set_gpu_chunk_count!(chunks)
-                    rechunked = run(y, Wmixed; permutations = 130, backend = backend, seed = 31)
-                    @test scoreperms(rechunked) == scoreperms(default)
-                    @test pvalue(rechunked) == pvalue(default)
-                    # Moments are merged chunk by chunk in floating point, so
-                    # only the draws and tail counts are bit-identical.
-                    @test mean(rechunked) ≈ mean(default) rtol = 1e-5 atol = 1e-6
-                    @test std(rechunked) ≈ std(default) rtol = 1e-4 atol = 1e-6
-                    streamed = run(y, Wmixed; permutations = 130, backend = backend, seed = 31,
-                                   return_perms = false)
-                    @test pvalue(streamed) == pvalue(default)
-                end
+                assert_chunk_invariant(run, Wmixed, y, 130, (1, 2, 7, 64, 129, 130, 1000))
+            end
+            # P above 8192 selects a moment block longer than 64, on a graph
+            # small enough to keep the run cheap.  None of these chunk counts
+            # divides P, and they straddle the rounding to whole blocks: with a
+            # 256-permutation block the requested 3, 7 and 97 become 3, 7 and
+            # 79 chunks, against 40 for the default rule.
+            ntiny = 8
+            Wtiny = mixed_degree_weights(ntiny, ntiny - 1)
+            ytiny = Float64.(mod.(collect(1:ntiny), 5))
+            @test GPU_EXTENSION._moment_block(20000) == 256
+            for run in runners
+                assert_chunk_invariant(run, Wtiny, ytiny, 20000, (3, 7, 97))
             end
         finally
             GPU_EXTENSION._set_gpu_chunk_count!(old_chunks)

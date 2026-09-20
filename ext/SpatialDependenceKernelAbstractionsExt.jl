@@ -24,8 +24,11 @@ const _GPU_CHUNK_COUNT_OVERRIDE = Ref{Int}(0)
 """
 Internal test hook; deliberately not part of the public keyword API.
 
-`0` restores the default rule.  Streams are keyed by (observation, permutation),
-so the chunk count only decides how permutations are spread over workers.
+`0` restores the default rule.  Streams are keyed by (observation, permutation)
+and moments are accumulated in blocks of the global permutation index, so the
+chunk count only decides how permutations are spread over workers: it cannot
+change any returned value.  Requested counts are rounded to whole moment blocks
+and renormalised, so the effective count may differ from the one passed here.
 """
 function _set_gpu_chunk_count!(chunks::Integer)
     chunks >= 0 || throw(ArgumentError("GPU chunk count override must be nonnegative"))
@@ -33,6 +36,27 @@ function _set_gpu_chunk_count!(chunks::Integer)
     _GPU_CHUNK_COUNT_OVERRIDE[] = Int(chunks)
     return old
 end
+
+"""
+Length of one on-device moment block, as a function of `permutations` alone.
+
+MOMENT_BLOCK_GLOBAL_INDEX: Welford moments are accumulated in fixed blocks of
+the *global* permutation index rather than per chunk.  Chunk sizes are rounded
+up to whole blocks (`crand_local_gpu`), so every block is produced start to
+finish by exactly one worker and the host always merges the same blocks in the
+same order.  Together with the (observation, permutation) RNG keying that makes
+the whole accelerated result — draws, p-values, mean, standard deviation and
+z-score — a function of the seed only, independent of the chunk count, of the
+row/chunk batching and of the scratch budget.
+
+The block *length* is therefore free, and is purely a cost trade-off.  Short
+blocks mean more partial moments to copy back and merge on the host
+(`n × permutations ÷ block` of them), which dominates `return_perms = false`
+runs at large `n`; long blocks mean fewer, longer Welford runs in device
+precision.  Growing the block with `permutations` caps the number of blocks per
+row at 128 for any `permutations`, so the merge cost stays proportional to `n`.
+"""
+_moment_block(permutations::Int) = 64 * nextpow(2, max(1, cld(permutations, 8192)))
 
 @inline function splitmix64(state::UInt64)
     state += 0x9e3779b97f4a7c15
@@ -170,10 +194,15 @@ end
     @Const(exact_observed), @Const(exact_defined), @Const(row_ids), global_scratch,
     n::Int32, row_count::Int32, chunk_count::Int32, chunk_size::Int32, total_permutations::Int32,
     chunk_first::Int32, scale::T, base_seed::UInt64, stat_code::Int32,
-    return_perms::Bool, use_global_scratch::Bool, scratch_stride::Int64,
+    return_perms::Bool, use_global_scratch::Bool, strides::NTuple{2, Int64},
     ::Val{PRIVATE_K}, ::Val{EXACT_TAILS}
 ) where {T, PRIVATE_K, EXACT_TAILS}
     local_i, local_c = @index(Global, NTuple)
+    # METAL_ARGUMENT_LIMIT: Metal binds at most 31 kernel arguments and this
+    # kernel sits exactly at that limit, so the two Int64 lengths travel as one
+    # tuple.  Pack further scalars the same way instead of adding arguments.
+    scratch_stride = strides[1]
+    moment_block = strides[2]
     chosen = @private Int32 (PRIVATE_K,)
     private_hash = @private Int32 (2 * PRIVATE_K,)
     exact_acc = @private UInt32 (EXACT_TAILS ? 8 : 1,)
@@ -225,6 +254,12 @@ end
             # pair owns its stream, so seeded draws never depend on how
             # permutations are chunked or batched across workers.
             row_key = base_seed ⊻ (unsafe_trunc(UInt64, i) * 0x9e3779b97f4a7c15)
+            # First global permutation index this batch of chunks covers, minus
+            # one: both the retained-draw column and the moment-block slot are
+            # relative to it.  `chunk_size` is a whole multiple of
+            # `moment_block` whenever more than one chunk exists, so this offset
+            # is block-aligned and no block ever straddles two workers.
+            permutation_offset = (Int64(chunk_first) - Int64(1)) * Int64(chunk_size)
             worker_linear = (Int64(local_i) - Int64(1)) * Int64(chunk_count) + Int64(local_c) - Int64(1)
             scratch_base = worker_linear * scratch_stride
             hash_capacity = use_global_scratch ? scratch_stride : Int64(2 * PRIVATE_K)
@@ -329,28 +364,47 @@ end
                     delta_cmp <= tol && (lower_count += Int32(1))
                 end
                 if return_perms
-                    permutation_offset = (Int64(chunk_first) - Int64(1)) * Int64(chunk_size)
                     full_perms[local_i, p - permutation_offset] = s_perm
                 end
-                p == p_start && (anchor = s_perm)
+                # Moment block boundaries follow the global permutation index.
+                # The block restarts at its first permutation, which also
+                # supplies the shift anchor, and is flushed at its last one
+                # (or at `p_end`, which only cuts a block short on the final
+                # permutation of the run).
+                block_pos = (p - Int64(1)) % moment_block
+                if block_pos == Int64(0)
+                    anchor = s_perm; mean_val = T(0); m2_val = T(0)
+                end
                 centered = s_perm - anchor
-                count = p - p_start + Int64(1)
+                count = block_pos + Int64(1)
                 delta = centered - mean_val
                 mean_val += delta / T(count)
                 delta2 = centered - mean_val
                 m2_val += delta * delta2
+                if block_pos == moment_block - Int64(1) || p == p_end
+                    block_slot = (p - Int64(1) - permutation_offset) ÷ moment_block + Int64(1)
+                    partial_mean[local_i, block_slot] = mean_val
+                    partial_m2[local_i, block_slot] = m2_val
+                    partial_anchor[local_i, block_slot] = anchor
+                end
             end
+            # Tail counts stay per chunk: they are exact integers, so the host
+            # sum does not depend on the order they are accumulated in.
             partial_upper[local_i, local_c] = upper_count
             partial_lower[local_i, local_c] = lower_count
-            partial_mean[local_i, local_c] = mean_val
-            partial_m2[local_i, local_c] = m2_val
-            partial_anchor[local_i, local_c] = anchor
         end
     end
 end
 
 # Compatibility adapter for exact-tail helper tests. It invokes the same worker
 # kernel in private mode; production uses the richer batched launcher.
+#
+# The adapter keeps the pre-moment-block contract: one moment block per chunk,
+# so `partial_mean`/`partial_m2`/`partial_anchor` keep their `nrows × nchunks`
+# shape and column `c` still holds the moments of chunk `c`.  Passing
+# `moment_block = chunk_size` reproduces that exactly, because the adapter
+# always launches from `chunk_first = 1`: block boundaries then coincide with
+# chunk boundaries and the block slot equals the chunk index.
 function local_perm_chunk_kernel!(backend, groupsize)
     worker_kernel = _local_perm_worker_kernel!(backend, groupsize)
     return function (partial_upper, partial_lower, partial_mean, partial_m2, partial_anchor,
@@ -368,7 +422,8 @@ function local_perm_chunk_kernel!(backend, groupsize)
                       exact_observed, exact_defined, row_ids, dummy_scratch,
                       Int32(n), Int32(nrows), Int32(nchunks), Int32(chunk_size), Int32(total_permutations),
                       Int32(1), scale, base_seed, stat_code, return_perms, false,
-                      Int64(1), private_val, exact_val; ndrange = ndrange)
+                      (Int64(1), Int64(max(1, Int(chunk_size)))), private_val, exact_val;
+                      ndrange = ndrange)
     end
 end
 
@@ -384,14 +439,18 @@ function _degree_bucket(k::Int)
     return bucket
 end
 
-@inline function _merge_chunk!(mean_all, m2_all, count_all, row, chunk_mean, chunk_m2, chunk_count)
+# Chan-Golub-LeVeque merge of one partial (mean, m2, count) into a row's
+# running moments.  Callers must merge blocks in increasing global permutation
+# order; that order, and hence the result down to its last bit, is fixed by
+# `_moment_block` alone.
+@inline function _merge_moments!(mean_all, m2_all, count_all, row, block_mean, block_m2, block_count)
     if count_all[row] == 0
-        mean_all[row] = chunk_mean; m2_all[row] = chunk_m2; count_all[row] = chunk_count
+        mean_all[row] = block_mean; m2_all[row] = block_m2; count_all[row] = block_count
     else
-        delta = chunk_mean - mean_all[row]
-        total = count_all[row] + chunk_count
-        mean_all[row] += delta * (chunk_count / total)
-        m2_all[row] += chunk_m2 + delta * delta * (count_all[row] * chunk_count / total)
+        delta = block_mean - mean_all[row]
+        total = count_all[row] + block_count
+        mean_all[row] += delta * (block_count / total)
+        m2_all[row] += block_m2 + delta * delta * (count_all[row] * block_count / total)
         count_all[row] = total
     end
 end
@@ -414,6 +473,13 @@ function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
     scratch_stride = use_global ? Int64(2) * Int64(bucket) : Int64(1)
     bytes_per_worker = use_global ? scratch_stride * Int64(sizeof(Int32)) : Int64(1)
     max_workers = max(Int64(1), Int64(scratch_budget) ÷ bytes_per_worker)
+    # Every span this loop hands to the kernel starts at a moment-block
+    # boundary, because its first permutation is `(chunk_first - 1) * chunk_size
+    # + 1` and `chunk_size` is a whole number of blocks.  A single chunk covers
+    # the whole run, so it needs no padding and is exempt.
+    moment_block = _moment_block(permutations)
+    (num_chunks <= 1 || chunk_size % moment_block == 0) ||
+        throw(ArgumentError("internal GPU chunk size is not a whole number of moment blocks"))
     row_pos = 1; chunk_first = 1
     while chunk_first <= num_chunks
         chunk_count = Int(min(num_chunks - chunk_first + 1, max_workers))
@@ -435,11 +501,14 @@ function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
             span_start = (chunk_first - 1) * chunk_size + 1
             span_end = min(permutations, (chunk_first + chunk_count - 1) * chunk_size)
             span = span_end - span_start + 1
+            # One moment column per block of this span, not per chunk; at most
+            # 128 columns for any `permutations` (see `_moment_block`).
+            span_blocks = cld(span, moment_block)
             batch_upper = KernelAbstractions.zeros(backend, Int32, nrows, chunk_count)
             batch_lower = KernelAbstractions.zeros(backend, Int32, nrows, chunk_count)
-            batch_mean = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
-            batch_m2 = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
-            batch_anchor = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, chunk_count)
+            batch_mean = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, span_blocks)
+            batch_m2 = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, span_blocks)
+            batch_anchor = KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, span_blocks)
             batch_perms = return_perms ? KernelAbstractions.zeros(backend, eltype(data_gpu), nrows, span) :
                          KernelAbstractions.zeros(backend, eltype(data_gpu), 0, 0)
             worker_kernel(batch_upper, batch_lower, batch_mean, batch_m2, batch_anchor,
@@ -452,7 +521,8 @@ function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
                           _checked_i32(chunk_size, "permutation chunk size"),
                           _checked_i32(permutations, "permutation count"),
                           _checked_i32(chunk_first, "chunk identity"), kernel_scale, base_seed,
-                          stat_code, return_perms, use_global, scratch_stride,
+                          stat_code, return_perms, use_global,
+                          (scratch_stride, Int64(moment_block)),
                           Val(use_global ? _GPU_PRIVATE_CROSSOVER : bucket), Val(exact_tails);
                           ndrange = (nrows, chunk_count))
             KernelAbstractions.synchronize(backend)
@@ -463,11 +533,14 @@ function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
                 for local_chunk in 1:chunk_count
                     total_upper[row] += Int64(hu[local_row, local_chunk])
                     total_lower[row] += Int64(hl[local_row, local_chunk])
-                    chunk_n = min(permutations, (chunk_first + local_chunk - 1) * chunk_size) -
-                              (chunk_first + local_chunk - 2) * chunk_size
-                    chunk_mean = Float64(ha[local_row, local_chunk]) + Float64(hm[local_row, local_chunk])
-                    _merge_chunk!(means, m2s, counts, row, chunk_mean,
-                                  Float64(hq[local_row, local_chunk]), chunk_n)
+                end
+                # Blocks are merged in global permutation order; only the last
+                # block of the last batch can be shorter than `moment_block`.
+                for block in 1:span_blocks
+                    block_n = min(moment_block, span - (block - 1) * moment_block)
+                    block_mean = Float64(ha[local_row, block]) + Float64(hm[local_row, block])
+                    _merge_moments!(means, m2s, counts, row, block_mean,
+                                    Float64(hq[local_row, block]), block_n)
                 end
                 if return_perms
                     for local_p in 1:span
@@ -558,7 +631,11 @@ function SpatialDependence.crand_local_gpu(
     num_chunks = _GPU_CHUNK_COUNT_OVERRIDE[] > 0 ?
                  min(_GPU_CHUNK_COUNT_OVERRIDE[], permutations) :
                  min(64, cld(permutations, 64))
-    chunk_size = cld(permutations, num_chunks)
+    # Round chunks up to whole moment blocks so every block is produced by one
+    # worker; a chunk that already covers the whole run needs no padding, and
+    # clamping it keeps `chunk_size` inside the device Int32 domain.
+    moment_block = _moment_block(permutations)
+    chunk_size = min(permutations, moment_block * cld(cld(permutations, num_chunks), moment_block))
     num_chunks = cld(permutations, chunk_size)  # drop chunks the rounding left empty
     centered_getis = stat_code == Int32(3) || stat_code == Int32(4)
     data64 = Float64.(data)
