@@ -323,6 +323,12 @@ backends = VENDOR_BACKEND === nothing ? (nothing, CPU()) : (nothing, CPU(), VEND
             @test !isempty(ir)
             text = join(sprint(show, item) for item in ir)
             @test !occursin("throw_inexacterror", text)
+            # `throw_boundserror` is deliberately *not* audited away for the
+            # worker kernel: it carries no `@inbounds`, so the computed moment
+            # column `(p - 1 - permutation_offset) ÷ moment_block + 1` traps on
+            # a wrong block slot instead of writing past the buffer.  Pinned so
+            # that blanket `@inbounds` has to be a deliberate change.
+            @test occursin("throw_boundserror", text)
         end
     end
 
@@ -572,8 +578,13 @@ end
         try
             # At P = 130 there are three 64-permutation blocks, the last one
             # partial (130 = 2 * 64 + 2).  Chunk sizes round down to whole
-            # blocks, so a request of 1 gives one chunk and every larger request
-            # gives three; the default rule also gives three.
+            # blocks, so the seven requests below collapse to two schedules: 1
+            # gives the single unaligned chunk of 130 that spans the whole run
+            # (the case exempt from block alignment), and 2, 7, 64, 129, 130 and
+            # 1000 all give three chunks of one block, which is what the default
+            # rule gives too.  For P <= 64 the override is inert altogether:
+            # there is one block, so every request floors to one block per chunk
+            # and `cld(P, chunk_size)` renormalises it to a single chunk.
             @test GPU_EXTENSION._moment_block(130) == 64
             for run in runners
                 assert_chunk_invariant(run, Wmixed, y, 130, (1, 2, 7, 64, 129, 130, 1000))
@@ -582,7 +593,8 @@ end
             # small enough to keep the run cheap.  None of these chunk counts
             # divides P, and they straddle the rounding to whole blocks: with a
             # 256-permutation block (79 blocks) the requested 3, 7 and 97 become
-            # 4, 8 and 79 chunks of 26, 11 and 1 blocks; the default rule gives 79.
+            # three distinct schedules of 4, 8 and 79 chunks, of 26, 11 and 1
+            # blocks; the default rule gives 79.
             ntiny = 8
             Wtiny = mixed_degree_weights(ntiny, ntiny - 1)
             ytiny = Float64.(mod.(collect(1:ntiny), 5))
@@ -595,6 +607,17 @@ end
             # permutation order changes the last bits of the moments.
             for run in runners
                 assert_chunk_invariant(run, Wtiny, ytiny, 20000, (39,); budget = 1)
+            end
+            # Everything above either varies the chunk count over just two
+            # schedules (P = 130) or does so with the 256-permutation block
+            # (P = 20000), leaving multi-block chunks at the default 64-length
+            # block untested.  P = 1000 is 16 such blocks, and requests of 2, 3
+            # and 7 give three distinct schedules there - 2, 4 and 8 chunks of
+            # 8, 5 and 2 blocks, against a default rule of 16 chunks of one
+            # block - on the same tiny graph, for a twentieth of the
+            # permutations of the P = 20000 case.
+            for run in runners
+                assert_chunk_invariant(run, Wtiny, ytiny, 1000, (2, 3, 7))
             end
         finally
             GPU_EXTENSION._set_gpu_chunk_count!(old_chunks)

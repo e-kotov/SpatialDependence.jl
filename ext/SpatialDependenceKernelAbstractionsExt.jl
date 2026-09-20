@@ -42,13 +42,14 @@ end
 Length of one on-device moment block, as a function of `permutations` alone.
 
 MOMENT_BLOCK_GLOBAL_INDEX: Welford moments are accumulated in fixed blocks of
-the *global* permutation index rather than per chunk.  Chunk sizes are rounded
-up to whole blocks (`crand_local_gpu`), so every block is produced start to
-finish by exactly one worker and the host always merges the same blocks in the
-same order.  Together with the (observation, permutation) RNG keying that makes
-the whole accelerated result — draws, p-values, mean, standard deviation and
-z-score — a function of the seed only, independent of the chunk count, of the
-row/chunk batching and of the scratch budget.
+the *global* permutation index rather than per chunk.  Chunk sizes are whole
+numbers of blocks (`crand_local_gpu` rounds the blocks per chunk down), so every
+block is produced start to finish by exactly one worker and the host always
+merges the same blocks in the same order.  Together with the (observation,
+permutation) RNG keying that makes the whole accelerated result — draws,
+p-values, mean, standard deviation and z-score — a function of the seed only,
+independent of the chunk count, of the row/chunk batching and of the scratch
+budget.
 
 The block *length* is therefore free, and is purely a cost trade-off.  Short
 blocks mean more partial moments to copy back and merge on the host
@@ -56,6 +57,16 @@ blocks mean more partial moments to copy back and merge on the host
 runs at large `n`; long blocks mean fewer, longer Welford runs in device
 precision.  Growing the block with `permutations` caps the number of blocks per
 row at 128 for any `permutations`, so the merge cost stays proportional to `n`.
+
+That cap is also the only thing bounding the moment buffers.  `_run_bucket!`
+allocates `partial_mean`, `partial_m2` and `partial_anchor` with one column per
+block of the launched *span*, so a row now carries up to 128 partials where the
+earlier per-chunk layout carried one per chunk in the batch (at most 64 under
+the default chunk rule).  All three are allocated on the device and copied whole
+to the host, i.e. `rows in the batch × blocks in the span × 3 × sizeof(T)` bytes
+on each side, at most `rows × 128 × 3 × sizeof(T)`.  Nothing clamps that:
+`_GPU_SCRATCH_BUDGET` sizes only the per-worker hash scratch, and the moment
+buffers are allocated outside its accounting.
 """
 _moment_block(permutations::Int) = 64 * nextpow(2, max(1, cld(permutations, 8192)))
 
