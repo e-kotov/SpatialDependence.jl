@@ -3,6 +3,10 @@ using KernelAbstractions
 using Test
 using StableRNGs
 
+if !isdefined(@__MODULE__, :VENDOR_BACKEND)
+    include(joinpath(@__DIR__, "gpu_backend.jl"))
+end
+
 const _exact_tail_ext = Base.get_extension(SpatialDependence,
                                            :SpatialDependenceKernelAbstractionsExt)
 const _exact_sub96! = _exact_tail_ext._exact_sub96!
@@ -95,17 +99,12 @@ end
     synchronize(CPU())
     @test Array(smoke) == Int32[12, 0, 0, 0, 0, 0, 0, 0, -1]
 
-    metal_backend = nothing
-    try
-        import Metal
-        Metal.functional() && (metal_backend = Metal.MetalBackend())
-    catch
-    end
-    if metal_backend !== nothing
-        metal_smoke = KernelAbstractions.zeros(metal_backend, Int32, 9)
-        _exact_limb_smoke!(metal_backend)(metal_smoke; ndrange = 1)
-        synchronize(metal_backend)
-        @test Array(metal_smoke) == Int32[12, 0, 0, 0, 0, 0, 0, 0, -1]
+    vendor_backend = VENDOR_BACKEND
+    if vendor_backend !== nothing
+        vendor_smoke = KernelAbstractions.zeros(vendor_backend, Int32, 9)
+        _exact_limb_smoke!(vendor_backend)(vendor_smoke; ndrange = 1)
+        synchronize(vendor_backend)
+        @test Array(vendor_smoke) == Int32[12, 0, 0, 0, 0, 0, 0, 0, -1]
 
         # Weight reduction keeps the exact payload within its integer bound,
         # but the public observed Float64 scores are non-finite.  This must be
@@ -118,7 +117,7 @@ end
             rng = StableRNG(918)
             reference = StableRNG(918)
             @test_throws ArgumentError f(bad_x, bad_W; permutations = 3,
-                                         backend = metal_backend, rng = rng)
+                                         backend = vendor_backend, rng = rng)
             @test rand(rng, UInt64) == rand(reference, UInt64)
         end
     end

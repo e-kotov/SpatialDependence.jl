@@ -10,35 +10,7 @@ using Random: rand, seed!
 const GPU_EXTENSION = Base.get_extension(SpatialDependence,
                                          :SpatialDependenceKernelAbstractionsExt)
 
-const VENDOR_BACKEND = let
-    candidate = nothing
-    try
-        import Metal
-        if Metal.functional()
-            candidate = Metal.MetalBackend()
-        end
-    catch
-    end
-    if candidate === nothing
-        try
-            import CUDA
-            if CUDA.functional()
-                candidate = CUDA.CUDABackend()
-            end
-        catch
-        end
-    end
-    if candidate === nothing
-        try
-            import AMDGPU
-            if AMDGPU.functional()
-                candidate = AMDGPU.ROCBackend()
-            end
-        catch
-        end
-    end
-    candidate
-end
+include(joinpath(@__DIR__, "gpu_backend.jl"))
 
 const METAL_BACKEND = let
     candidate = nothing
@@ -483,6 +455,15 @@ end
         @test all(isnan, std(result))
         @test all(isnan, zscore(result))
         @test size(scoreperms(result)) == (3, 0)
+    end
+
+    @testset "boundary seeds are repeatable within a backend" begin
+        for seed in (UInt64(0), typemax(UInt64))
+            a = localmoran(x, W; permutations = 17, backend = backend, seed = seed)
+            b = localmoran(x, W; permutations = 17, backend = backend, seed = seed)
+            @test scoreperms(a) == scoreperms(b)
+            @test pvalue(a) == pvalue(b)
+        end
     end
 
     if backend !== nothing
