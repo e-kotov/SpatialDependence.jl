@@ -258,9 +258,9 @@ function issignificant(x::AbstractLocalSpatialAutocorrelation, α::Float64; adju
     elseif adjust == :fdr
         psort = sort(p)
         pfdr = (1:n) .* α ./ n
-        lower = psort .< pfdr
-        threshold = findfirst(x -> x == false, lower)
-        return p .< pfdr[threshold]
+        threshold = findlast(psort .<= pfdr)
+        threshold === nothing && return falses(n)
+        return p .<= pfdr[threshold]
     end
 end
 

@@ -14,5 +14,6 @@ using Test
     include("random.jl")
     include("gpu_tests.jl")
     include("exact_tail_helpers.jl")
+    include("significance.jl")
 
 end
