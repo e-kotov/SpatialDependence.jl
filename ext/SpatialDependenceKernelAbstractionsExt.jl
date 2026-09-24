@@ -573,6 +573,7 @@ function _cpu_comparison_pvalues(data::AbstractVector, W::SpatialWeights,
                                  base_seed::UInt64, local_calc_function::Function,
                                  local_tolerance)
     n = length(data)
+    n32 = _checked_i32(n, "number of observations")
     upper = zeros(Int, n)
     lower = zeros(Int, n)
     Threads.@threads for i in 1:n
@@ -582,9 +583,8 @@ function _cpu_comparison_pvalues(data::AbstractVector, W::SpatialWeights,
         seen = k <= 64 ? Vector{Int}(undef, k) : nothing
         seen_set = k > 64 ? Set{Int}() : nothing
         wi = weights(W, i)
-        n32 = _checked_i32(n, "number of observations")
-        i32 = _checked_i32(i, "observation index")
-        tol = local_tolerance === nothing ? nothing : local_tolerance[i]
+        i32 = Int32(i)
+        tol = local_tolerance[i]
         for p in 1:permutations
             state, _ = splitmix64(base_seed ⊻
                 (unsafe_trunc(UInt64, i) * 0x9e3779b97f4a7c15) ⊻
@@ -637,9 +637,9 @@ function SpatialDependence.crand_local_gpu(
     permutations >= 0 || throw(ArgumentError("permutations must be nonnegative"))
     length(data) == length(obs_stat) || throw(ArgumentError("data and observed statistic lengths must match"))
     SpatialDependence._validate_local_precision(backend, precision)
-    SpatialDependence._validate_local_comparison(backend, comparison)
-    comparison === :cpu && !(local_calc_function isa Function) &&
-        throw(ArgumentError("comparison=:cpu requires a CPU statistic closure"))
+    comparison === :cpu &&
+        !(local_calc_function isa Function && local_tolerance !== nothing) &&
+        throw(ArgumentError("comparison=:cpu requires a CPU statistic closure and row tolerances"))
     validated_seed = SpatialDependence._validate_local_seed(seed)
     actual_backend = if backend === :gpu
         candidates = Tuple{Symbol, Any}[]

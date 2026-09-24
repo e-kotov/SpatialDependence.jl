@@ -66,6 +66,13 @@ function mixed_degree_weights(n::Int, k::Int)
     SpatialWeights(Int64(n), neighs, w, Int64.(length.(neighs)), :row)
 end
 
+# Every non-island row has k cyclic successors with unequal weights 1:k.
+function banded_weights(n::Int, k::Int; islands = ())
+    neighs = [i in islands ? Int64[] : Int64.(mod1.(i .+ (1:k), n)) for i in 1:n]
+    w = [Float64.(eachindex(v)) ./ (length(v) * (length(v) + 1) / 2) for v in neighs]
+    SpatialWeights(Int64(n), neighs, w, Int64.(length.(neighs)), :row)
+end
+
 function assert_summary_agrees(result)
     perms = scoreperms(result)
     @test size(perms, 1) == length(score(result))
@@ -895,12 +902,14 @@ end
         A4 = [0.0 1 0 1; 1 0 1 0; 0 1 0 1; 1 0 1 0]
         W4 = SpatialWeights(A4)
         xnear_gi = [1.0, nextfloat(1.0), nextfloat(1.0, 2), nextfloat(1.0, 3)]
-        cpu_ties = getisord(xnear_gi, W4; star = false, permutations = 31,
-                            backend = CPU(), comparison = :cpu, seed = 42)
-        default_order = getisord(xnear_gi, W4; star = false, permutations = 31,
-                                 backend = CPU(), seed = 42)
-        @test pvalue(cpu_ties) == ones(4)
-        @test minimum(pvalue(default_order)) < 0.5
+        for device in unique(comparison_backends)
+            cpu_ties = getisord(xnear_gi, W4; star = false, permutations = 31,
+                                backend = device, comparison = :cpu, seed = 42)
+            default_order = getisord(xnear_gi, W4; star = false, permutations = 31,
+                                     backend = device, seed = 42)
+            @test pvalue(cpu_ties) == ones(4)
+            @test minimum(pvalue(default_order)) < 0.5
+        end
         nonfinite = localmoran(ones(6), W6; permutations = 17, backend = CPU(),
                                comparison = :cpu, seed = 42)
         @test pvalue(nonfinite) == ones(6)
@@ -918,6 +927,26 @@ end
         wide = localmoran(x65, W65; permutations = 3, backend = CPU(),
                           comparison = :cpu, seed = 17)
         @test pvalue(wide)[1] == cpu_comparison_oracle(:moran, x65, W65, 3, 17)[1]
+
+        # Unequal within-row weights and islands; the k > 64 case keeps
+        # permutations * k < n - 1 so its draws cannot exhaust the pool.
+        island_rows = (3, 17)
+        replay_cases = ((rand(StableRNG(61), 24) .+ 0.5, mixed_degree_weights(24, 8), 99),
+                        (rand(StableRNG(62), 24) .+ 0.5, banded_weights(24, 5), 99),
+                        (rand(StableRNG(63), 24) .+ 0.5,
+                         banded_weights(24, 5; islands = island_rows), 99),
+                        (rand(StableRNG(64), 400) .+ 0.5, banded_weights(400, 65), 5))
+        for device in unique(comparison_backends), (xcase, Wcase, P) in replay_cases,
+            (stat, run) in runners
+            replayed = run(xcase, Wcase; permutations = P, backend = device,
+                           comparison = :cpu, seed = 23)
+            @test pvalue(replayed) == cpu_comparison_oracle(
+                stat == :getisord_star ? :getisord : stat, xcase, Wcase, P, 23;
+                star = stat == :getisord_star)
+            any(iszero, Wcase.nneighs) &&
+                @test pvalue(replayed)[collect(island_rows)] == ones(length(island_rows))
+            Wcase.n == 400 && @test any(<(1), pvalue(replayed))
+        end
 
         old_chunks = GPU_EXTENSION._set_gpu_chunk_count!(0)
         old_budget = GPU_EXTENSION._set_gpu_scratch_budget!(64)
@@ -949,14 +978,14 @@ end
 
     cpu = CPU()
     cpu_fp64 = supports_float64(cpu)
-    if cpu_fp64
-        Woffset = SpatialWeights([0.0 1 1 0; 1 0 1 0; 1 1 0 1; 0 0 1 0])
-        xoffset = 1e16 .+ [0.0, 2.0, 4.0, 6.0]
+    Woffset = SpatialWeights([0.0 1 1 0; 1 0 1 0; 1 1 0 1; 0 0 1 0])
+    xoffset = 1e16 .+ [0.0, 2.0, 4.0, 6.0]
+    for device in filter(b -> b !== nothing && supports_float64(b), (cpu, VENDOR_BACKEND))
         for (run, stat) in ((localmoran, :moran), (localgeary, :geary))
             native = run(xoffset, Woffset; permutations = 3, seed = 19)
-            default_fp64 = run(xoffset, Woffset; permutations = 3, backend = cpu,
+            default_fp64 = run(xoffset, Woffset; permutations = 3, backend = device,
                                precision = Float64, seed = 19)
-            replayed = run(xoffset, Woffset; permutations = 3, backend = cpu,
+            replayed = run(xoffset, Woffset; permutations = 3, backend = device,
                            comparison = :cpu, precision = Float64, seed = 19)
             @test score(default_fp64) != score(native)
             @test score(replayed) == score(native)

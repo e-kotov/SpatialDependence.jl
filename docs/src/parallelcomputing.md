@@ -14,7 +14,9 @@ inference for statistical agreement rather than expecting identical permutation 
 default Float32 p-value path uses bounded exact integer tail comparisons over its validated input
 domain. Outside that domain, the default Float32 path rejects inputs it cannot represent under
 that contract. Float64 accelerated p-values use floating-point comparisons and are not exact
-integer tails. In both precisions, summaries and retained draws use backend arithmetic.
+integer tails. In both precisions, summaries and retained draws use backend arithmetic. Near
+floating-point ties, default accelerated p-values may therefore differ systematically from native
+CPU p-values, which count draws within a row tolerance as ties.
 
 To count p-values with the native CPU statistic and its row tolerance on the accelerated samples,
 pass `comparison=:cpu` with a backend:
@@ -24,10 +26,13 @@ result = localmoran(x, W; backend = CUDABackend(), seed = 42,
                     comparison = :cpu, return_perms = false)
 ```
 
-This replays every sampled neighborhood on the CPU, replaces only p-values, and may add substantial
-work proportional to the total sampled degree. GPU summaries and retained draws still use the
-selected accelerator. With `precision=Float64`, this mode uses ordinary CPU centering for Moran
-and Geary, so their scores and summaries can differ from the default shift-first Float64 path.
+This replays every sampled neighborhood on the CPU and replaces only p-values. The replay redraws
+the `k` distinct neighbors of each observation and permutation by rejection sampling, checking
+duplicates with a linear scan up to `k = 64` (quadratic in `k`) and a hash set above that, and
+the expected number of redraws grows as `k` approaches `n - 1`, so it can add substantial CPU
+work. GPU summaries and retained draws still use the selected accelerator. With
+`precision=Float64`, this mode uses ordinary CPU centering for Moran and Geary, so their scores
+and summaries can differ from the default shift-first Float64 path.
 
 For a local Metal check on an Apple Silicon machine, run this from the package root:
 
