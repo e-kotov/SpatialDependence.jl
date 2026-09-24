@@ -923,7 +923,7 @@ end
                    comparison = :cpu, rng = rng)
         @test rand(rng) == rand(expected_rng)
 
-        W65 = degree_weights(66, 65); x65 = Float64.(mod.(1:66, 7))
+        W65 = degree_weights(200, 65); x65 = Float64.(mod.(1:200, 7))
         wide = localmoran(x65, W65; permutations = 3, backend = CPU(),
                           comparison = :cpu, seed = 17)
         @test pvalue(wide)[1] == cpu_comparison_oracle(:moran, x65, W65, 3, 17)[1]
