@@ -1,0 +1,52 @@
+name: Metal
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  metal:
+    name: Julia ${{ matrix.version }} - Metal - macos-15
+    # macos-15 arm64 runners expose a paravirtual Metal device; macos-14 exposes none.
+    # This establishes correctness only: timings on a virtualised GPU are not meaningful.
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'
+          - '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+      - uses: actions/cache@v6
+        env:
+          cache-name: cache-artifacts
+        with:
+          path: ~/.julia/artifacts
+          key: ${{ runner.os }}-metal-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-metal-${{ env.cache-name }}-
+      - name: Provision a temporary test environment
+        run: |
+          echo "SPDEP_TESTENV=$RUNNER_TEMP/testenv" >> "$GITHUB_ENV"
+          SPDEP_REPO="$PWD" julia --startup-file=no --project="$RUNNER_TEMP/testenv" -e '
+            using Pkg
+            Pkg.develop(path=ENV["SPDEP_REPO"])
+            Pkg.add(["GeoInterface", "KernelAbstractions", "RecipesBase", "SpatialDatasets", "StableRNGs", "Metal"])'
+      - name: Require a functional Metal device
+        run: |
+          julia --startup-file=no --project="$SPDEP_TESTENV" -e '
+            using Metal
+            Metal.versioninfo()
+            Metal.functional() || error("Metal is not functional on this runner")
+            println("METAL_DEVICE=", Metal.device().name)'
+      - name: Run the test suite on Metal
+        env:
+          SPATIALDEPENDENCE_TEST_BACKEND: metal
+        run: julia --startup-file=no --project="$SPDEP_TESTENV" test/runtests.jl
