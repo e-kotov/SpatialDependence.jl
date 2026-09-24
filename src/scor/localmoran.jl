@@ -19,19 +19,21 @@ Compute the Local Moran test of spatial autocorrelation.
 - `rng=default_rng()`: random number generator for CPU permutations; with a backend and no explicit `seed`, one `UInt64` seed is drawn from `rng`. An explicit `seed` takes precedence.
 - `corrected=true`: divide the scaling factor by ``n-1`` instead of ``n``.
 - `backend=nothing`: execution backend (e.g. `MetalBackend()`, `CUDABackend()`, or `:gpu`); accelerated permutations default to Float32 and support up to ``n-1`` neighbors per observation, subject to available device scratch memory. Set `precision=Float64` on a backend that supports Float64; Metal currently does not.
-- `precision=nothing`: accelerated arithmetic precision (`Float32` or `Float64`); an explicit precision requires `backend`. Every accelerated Float32 path uses bounded integer tail comparisons exact relative to its validated Float64-converted raw data and weights, avoiding tolerance-induced p-value errors; unsupported or out-of-domain inputs are rejected. `scoreperms`, means, standard deviations, and z-scores remain Float32-derived and approximate (and can be nonfinite). Use explicit Float64 on a supporting backend for native Float64 summaries. Explicit Float64 also uses shift-first host centering for large offsets. `nothing` preserves the default CPU behavior when no backend is supplied.
+- `precision=nothing`: accelerated arithmetic precision (`Float32` or `Float64`); an explicit precision requires `backend`. The default Float32 path uses bounded exact integer tail comparisons only on its validated input domain; Float64 p-values use floating-point comparisons. Summaries and retained draws remain backend-derived and approximate. `comparison=:cpu` replays the accelerated samples through the native CPU statistic and tolerance to replace only p-values. With Float64, it also uses ordinary CPU centering, so Moran scores and summaries can differ from the default shift-first path. `nothing` preserves the default CPU behavior when no backend is supplied.
+- `comparison=nothing`: optionally set to `:cpu` with a backend for full CPU replay of the accelerated samples. Replay costs CPU statistic work proportional to the total sampled degree and does not reproduce the ordinary CPU run's random samples.
 - `return_perms=true`: retain the full permutation matrix; otherwise return an empty `0 × permutations` matrix and use fixed-size CPU batches.
 - `seed=nothing`: optional nonnegative seed in the UInt64 range. It overrides `rng` on CPU; on a backend it overrides the backend seed draw.
 """
 function localmoran(x::AbstractVector{T} where T, W::SpatialWeights; permutations::Int = 9999,
     corrected::Bool = true, rng::AbstractRNG = default_rng(),
     backend = nothing, return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing,
-    precision = nothing)::LocalMoran
+    precision = nothing, comparison = nothing)::LocalMoran
 
     _validate_local_precision(backend, precision)
+    _validate_local_comparison(backend, comparison)
 
     n = length(x)
-    z = if backend !== nothing && precision === Float64 && !isempty(x)
+    z = if backend !== nothing && precision === Float64 && comparison !== :cpu && !isempty(x)
         # Shift before centering so a large location offset does not consume
         # Float64 mantissa bits before the small spatial signal is formed.
         x64 = Float64.(x)
@@ -79,7 +81,8 @@ function localmoran(x::AbstractVector{T} where T, W::SpatialWeights; permutation
         Iperms, p, Ipermsmean, Ipermsstd, zval = crand_local_gpu(
             backend, :moran, permutations, z, W, I, m2;
             return_perms=return_perms, seed=seed, rng=rng, precision=precision,
-            comparison_data=x
+            comparison=comparison, local_calc_function=localmoran_calc,
+            local_tolerance=local_tolerance, comparison_data=x
         )
     else
         local_rng = _local_rng(rng, seed)

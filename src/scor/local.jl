@@ -19,6 +19,14 @@ function _validate_local_precision(backend, precision)
     return precision
 end
 
+function _validate_local_comparison(backend, comparison)
+    comparison === nothing || comparison === :cpu ||
+        throw(ArgumentError("comparison must be nothing or :cpu"))
+    comparison === :cpu && backend === nothing &&
+        throw(ArgumentError("comparison=:cpu requires an accelerated backend"))
+    return comparison
+end
+
 function _validate_local_seed(seed::Union{Integer, Nothing})
     seed === nothing && return nothing
     seed isa Integer || throw(ArgumentError("seed must be a nonnegative integer in the UInt64 range"))

@@ -20,16 +20,18 @@ Compute the Getis-Ord statistic.
 - `permutations=9999`: number of permutations for the randomization test.
 - `rng=default_rng()`: random number generator for CPU permutations; with a backend and no explicit `seed`, one `UInt64` seed is drawn from `rng`. An explicit `seed` takes precedence.
 - `backend=nothing`: execution backend (e.g. `MetalBackend()`, `CUDABackend()`, or `:gpu`); accelerated permutations default to Float32 and support up to ``n-1`` neighbors per observation, subject to available device scratch memory. Set `precision=Float64` on a backend that supports Float64; Metal currently does not.
-- `precision=nothing`: accelerated arithmetic precision (`Float32` or `Float64`); an explicit precision requires `backend`. Every accelerated Float32 path uses bounded integer tail comparisons exact relative to its validated Float64-converted raw data and weights, avoiding tolerance-induced p-value errors; unsupported or out-of-domain inputs are rejected. `scoreperms`, means, standard deviations, and z-scores remain Float32-derived and approximate (and can be nonfinite). Use explicit Float64 on a supporting backend for native Float64 summaries. `nothing` preserves the default CPU behavior when no backend is supplied.
+- `precision=nothing`: accelerated arithmetic precision (`Float32` or `Float64`); an explicit precision requires `backend`. The default Float32 path uses bounded exact integer tail comparisons only on its validated input domain; Float64 p-values use floating-point comparisons. Summaries and retained draws remain backend-derived and approximate. `comparison=:cpu` replays the accelerated samples through the native CPU statistic and tolerance to replace only p-values. `nothing` preserves the default CPU behavior when no backend is supplied.
+- `comparison=nothing`: optionally set to `:cpu` with a backend for full CPU replay of the accelerated samples. Replay costs CPU statistic work proportional to the total sampled degree and does not reproduce the ordinary CPU run's random samples.
 - `return_perms=true`: retain the full permutation matrix; otherwise return an empty `0 × permutations` matrix and use fixed-size CPU batches.
 - `seed=nothing`: optional nonnegative seed in the UInt64 range. It overrides `rng` on CPU; on a backend it overrides the backend seed draw.
 """
 function getisord(x::AbstractVector{T} where T, W::SpatialWeights; permutations::Int = 9999,
     star::Bool = true, rng::AbstractRNG = default_rng(),
     backend = nothing, return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing,
-    precision = nothing)::GetisOrd
+    precision = nothing, comparison = nothing)::GetisOrd
 
     _validate_local_precision(backend, precision)
+    _validate_local_comparison(backend, comparison)
 
     wt = wtransformation(W) 
     wt == :row || wt == :binary || throw(ArgumentError("W must be row standardized or binary"))
@@ -87,7 +89,8 @@ function getisord(x::AbstractVector{T} where T, W::SpatialWeights; permutations:
         Gperms, p, Gpermsmean, Gpermsstd, zval = crand_local_gpu(
             backend, stat_sym, permutations, x, W, G, denon;
             return_perms=return_perms, seed=seed, rng=rng, precision=precision,
-            comparison_data=x
+            comparison=comparison, local_calc_function=getisord_calc_fun,
+            local_tolerance=local_tolerance, comparison_data=x
         )
     else
         local_rng = _local_rng(rng, seed)

@@ -107,6 +107,58 @@ function replay_index(state::UInt64, n::Int, exclude::Int)
     return index, state
 end
 
+function cpu_comparison_oracle(stat, x, W, permutations, seed; star = false)
+    n = length(x); z = x .- mean(x); m2 = Float64(sum(z .^ 2)) / (n - 1)
+    denominator = Float64(sum(x)); upper = zeros(Int, n); lower = zeros(Int, n)
+    wt = wtransformation(W); maxabsx = maximum(abs, x; init = 0.0)
+    for i in 1:n
+        k = Int(W.nneighs[i]); k == 0 && continue
+        wi = weights(W, i); neigh = neighbors(W, i)
+        observed = if stat == :moran
+            (z[i] / m2) * sum(wi .* z[neigh])
+        elseif stat == :geary
+            (1 / m2) * sum(wi .* (z[i] .- z[neigh]).^2)
+        elseif stat == :getisord
+            star ? ((wt == :row ? 1 / (k + 1) : 1) * x[i] +
+                    sum((wt == :row ? 1 / (k + 1) : 1) .* x[neigh])) / denominator :
+                   sum(wi .* x[neigh]) / (denominator - x[i])
+        end
+        tolerance = if stat == :moran
+            8eps(Float64) * (k + 2) * abs(z[i] / m2) * sum(abs, wi) * maximum(abs, z)
+        elseif stat == :geary
+            8eps(Float64) * (k + 2) * abs(1 / m2) * sum(abs, wi) *
+                (abs(z[i]) + maximum(abs, z))^2
+        else
+            den = star ? denominator : denominator - x[i]
+            wsum = star ? (wt == :row ? 1 / (k + 1) : 1.0) * (k + 1) : sum(abs, wi)
+            den == 0 ? 0.0 : 8eps(Float64) * (k + 2) * wsum * maxabsx / abs(den)
+        end
+        row_key = UInt64(seed) ⊻ (UInt64(i) * 0x9e3779b97f4a7c15)
+        for p in 1:permutations
+            state, _ = replay_splitmix(row_key ⊻ (UInt64(p) * 0x517cc1b727220a95))
+            chosen = Int[]
+            while length(chosen) < k
+                j, state = replay_index(state, n, i)
+                j in chosen || push!(chosen, j)
+            end
+            value = if stat == :moran
+                (z[i] / m2) * sum(wi .* z[chosen])
+            elseif stat == :geary
+                (1 / m2) * sum(wi .* (z[i] .- z[chosen]).^2)
+            elseif stat == :getisord
+                star ? ((wt == :row ? 1 / (k + 1) : 1) * x[i] +
+                        sum((wt == :row ? 1 / (k + 1) : 1) .* x[chosen])) / denominator :
+                       sum(wi .* x[chosen]) / (denominator - x[i])
+            end
+            upper[i] += !isfinite(value) || !isfinite(observed) || value >= observed - tolerance
+            lower[i] += !isfinite(value) || !isfinite(observed) || value <= observed + tolerance
+        end
+    end
+    p = (min.(upper, lower) .+ 1) ./ (permutations + 1)
+    p[W.nneighs .== 0] .= 1
+    p
+end
+
 function replay_oracle(stat::Symbol, x::Vector{Float64}, W::SpatialWeights,
                        permutations::Int, seed::Integer)
     n = length(x)
@@ -817,14 +869,101 @@ end
                (:getisord, (x, W; kwargs...) -> getisord(x, W, star = false; kwargs...)),
                (:getisord_star, (x, W; kwargs...) -> getisord(x, W, star = true; kwargs...)))
 
+    @testset "native CPU comparison on accelerated samples" begin
+        comparison_backends = filter(!isnothing, (CPU(), VENDOR_BACKEND, METAL_BACKEND))
+        cases = ((Float64.(x6), W6), (Float32.(x6), W6),
+                 (1e8 .+ Float64.(x6), W6))
+        for device in unique(comparison_backends), (xcase, Wcase) in cases,
+            (stat, run) in runners
+            result = run(xcase, Wcase; permutations = 17, backend = device,
+                         comparison = :cpu, seed = 42, precision = Float32)
+            @test pvalue(result) == cpu_comparison_oracle(
+                stat == :getisord_star ? :getisord : stat, xcase, Wcase, 17, 42;
+                star = stat == :getisord_star)
+            streamed = run(xcase, Wcase; permutations = 17, backend = device,
+                           comparison = :cpu, seed = 42, precision = Float32,
+                           return_perms = false)
+            @test pvalue(streamed) == pvalue(result)
+            @test isempty(scoreperms(streamed))
+            repeated = run(xcase, Wcase; permutations = 17, backend = device,
+                           comparison = :cpu, seed = 42, precision = Float32)
+            @test pvalue(repeated) == pvalue(result)
+        end
+
+        # Native tolerance groups these adjacent-float Gi values into ties;
+        # the default bounded comparator keeps its exact ordering.
+        A4 = [0.0 1 0 1; 1 0 1 0; 0 1 0 1; 1 0 1 0]
+        W4 = SpatialWeights(A4)
+        xnear_gi = [1.0, nextfloat(1.0), nextfloat(1.0, 2), nextfloat(1.0, 3)]
+        cpu_ties = getisord(xnear_gi, W4; star = false, permutations = 31,
+                            backend = CPU(), comparison = :cpu, seed = 42)
+        default_order = getisord(xnear_gi, W4; star = false, permutations = 31,
+                                 backend = CPU(), seed = 42)
+        @test pvalue(cpu_ties) == ones(4)
+        @test minimum(pvalue(default_order)) < 0.5
+        nonfinite = localmoran(ones(6), W6; permutations = 17, backend = CPU(),
+                               comparison = :cpu, seed = 42)
+        @test pvalue(nonfinite) == ones(6)
+
+        rng = StableRNG(91); expected_rng = copy(rng)
+        @test_throws ArgumentError localmoran(x6, W6; permutations = 0,
+                                               backend = CPU(), comparison = :invalid,
+                                               rng = rng)
+        @test rand(rng) == rand(expected_rng)
+        localmoran(x6, W6; permutations = 0, backend = CPU(),
+                   comparison = :cpu, rng = rng)
+        @test rand(rng) == rand(expected_rng)
+
+        W65 = degree_weights(66, 65); x65 = Float64.(mod.(1:66, 7))
+        wide = localmoran(x65, W65; permutations = 3, backend = CPU(),
+                          comparison = :cpu, seed = 17)
+        @test pvalue(wide)[1] == cpu_comparison_oracle(:moran, x65, W65, 3, 17)[1]
+
+        old_chunks = GPU_EXTENSION._set_gpu_chunk_count!(0)
+        old_budget = GPU_EXTENSION._set_gpu_scratch_budget!(64)
+        try
+            baseline = localgeary(x6, W6; permutations = 17, backend = CPU(),
+                                  comparison = :cpu, seed = 42)
+            for chunks in (1, 7)
+                GPU_EXTENSION._set_gpu_chunk_count!(chunks)
+                GPU_EXTENSION._set_gpu_scratch_budget!(64)
+                changed = localgeary(x6, W6; permutations = 17, backend = CPU(),
+                                     comparison = :cpu, seed = 42)
+                @test pvalue(changed) == pvalue(baseline)
+            end
+        finally
+            GPU_EXTENSION._set_gpu_chunk_count!(old_chunks)
+            GPU_EXTENSION._set_gpu_scratch_budget!(old_budget)
+        end
+    end
+
     @test_throws ArgumentError localmoran(x6, W6, permutations = 0, precision = Float64)
     @test_throws ArgumentError localmoran(x6, W6, permutations = 0,
                                           backend = CPU(), precision = Float16)
     @test_throws ArgumentError localmoran(x6, W6, permutations = 0,
                                           backend = CPU(), precision = :double)
+    @test_throws ArgumentError localmoran(x6, W6, permutations = 0,
+                                          comparison = :gpu)
+    @test_throws ArgumentError localmoran(x6, W6, permutations = 0,
+                                          comparison = :cpu)
 
     cpu = CPU()
     cpu_fp64 = supports_float64(cpu)
+    if cpu_fp64
+        Woffset = SpatialWeights([0.0 1 1 0; 1 0 1 0; 1 1 0 1; 0 0 1 0])
+        xoffset = 1e16 .+ [0.0, 2.0, 4.0, 6.0]
+        for (run, stat) in ((localmoran, :moran), (localgeary, :geary))
+            native = run(xoffset, Woffset; permutations = 3, seed = 19)
+            default_fp64 = run(xoffset, Woffset; permutations = 3, backend = cpu,
+                               precision = Float64, seed = 19)
+            replayed = run(xoffset, Woffset; permutations = 3, backend = cpu,
+                           comparison = :cpu, precision = Float64, seed = 19)
+            @test score(default_fp64) != score(native)
+            @test score(replayed) == score(native)
+            @test pvalue(replayed) == cpu_comparison_oracle(
+                stat, xoffset, Woffset, 3, 19)
+        end
+    end
     if cpu_fp64
       for (stat, run) in runners
         oracle = replay_oracle(stat, Float64.(x6), W6, 31, 42)

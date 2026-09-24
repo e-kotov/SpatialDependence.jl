@@ -11,9 +11,23 @@ Metal runs use a deterministic stream for each observation and permutation, so r
 with the same `seed` on the same backend, with the same inputs and library environment, gives the
 same result. CPU and GPU runs use different Monte Carlo samples; compare their statistics and
 inference for statistical agreement rather than expecting identical permutation draws. The
-approximate summaries use the backend's floating-point arithmetic, while the bounded exact-tail
-path preserves its integer counting contract; near floating-point ties, accelerated exact tails
-may therefore differ systematically from CPU tolerance-based comparisons.
+default Float32 p-value path uses bounded exact integer tail comparisons over its validated input
+domain. Outside that domain, the default Float32 path rejects inputs it cannot represent under
+that contract. Float64 accelerated p-values use floating-point comparisons and are not exact
+integer tails. In both precisions, summaries and retained draws use backend arithmetic.
+
+To count p-values with the native CPU statistic and its row tolerance on the accelerated samples,
+pass `comparison=:cpu` with a backend:
+
+```julia
+result = localmoran(x, W; backend = CUDABackend(), seed = 42,
+                    comparison = :cpu, return_perms = false)
+```
+
+This replays every sampled neighborhood on the CPU, replaces only p-values, and may add substantial
+work proportional to the total sampled degree. GPU summaries and retained draws still use the
+selected accelerator. With `precision=Float64`, this mode uses ordinary CPU centering for Moran
+and Geary, so their scores and summaries can differ from the default shift-first Float64 path.
 
 For a local Metal check on an Apple Silicon machine, run this from the package root:
 

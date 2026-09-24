@@ -568,15 +568,78 @@ function _run_bucket!(backend, worker_kernel, rows::Vector{Int}, bucket::Int,
     return nothing
 end
 
+function _cpu_comparison_pvalues(data::AbstractVector, W::SpatialWeights,
+                                 observed::AbstractVector, permutations::Int,
+                                 base_seed::UInt64, local_calc_function::Function,
+                                 local_tolerance)
+    n = length(data)
+    upper = zeros(Int, n)
+    lower = zeros(Int, n)
+    Threads.@threads for i in 1:n
+        k = Int(W.nneighs[i])
+        k == 0 && continue
+        sampled_values = Vector{eltype(data)}(undef, k)
+        seen = k <= 64 ? Vector{Int}(undef, k) : nothing
+        seen_set = k > 64 ? Set{Int}() : nothing
+        wi = weights(W, i)
+        n32 = _checked_i32(n, "number of observations")
+        i32 = _checked_i32(i, "observation index")
+        tol = local_tolerance === nothing ? nothing : local_tolerance[i]
+        for p in 1:permutations
+            state, _ = splitmix64(base_seed ⊻
+                (unsafe_trunc(UInt64, i) * 0x9e3779b97f4a7c15) ⊻
+                (unsafe_trunc(UInt64, p) * 0x517cc1b727220a95))
+            k > 64 && empty!(seen_set)
+            accepted = 0
+            while accepted < k
+                index, state = rand_index(state, n32, i32)
+                idx = Int(index)
+                duplicate = if k <= 64
+                    found = false
+                    @inbounds for prior in 1:accepted
+                        if seen[prior] == idx
+                            found = true
+                            break
+                        end
+                    end
+                    found
+                else
+                    idx in seen_set
+                end
+                duplicate && continue
+                accepted += 1
+                if k <= 64
+                    seen[accepted] = idx
+                else
+                    push!(seen_set, idx)
+                end
+                @inbounds sampled_values[accepted] = data[idx]
+            end
+            value = local_calc_function(data[i], wi, sampled_values)
+            upper_i, lower_i = SpatialDependence._local_tail_counts(
+                (value,), observed[i]; tolerance = tol)
+            upper[i] += upper_i
+            lower[i] += lower_i
+        end
+    end
+    p = (Float64.(min.(upper, lower)) .+ 1.0) ./ (permutations + 1.0)
+    p[W.nneighs .== 0] .= 1.0
+    return p
+end
+
 function SpatialDependence.crand_local_gpu(
     backend, stat_type::Symbol, permutations::Int, data::AbstractVector,
     W::SpatialWeights, obs_stat::AbstractVector, scale_param::Number;
     return_perms::Bool = true, seed::Union{Integer, Nothing} = nothing,
     rng::AbstractRNG = default_rng(), precision = nothing,
-    comparison_data::Union{Nothing, AbstractVector} = nothing)
+    comparison_data::Union{Nothing, AbstractVector} = nothing,
+    comparison = nothing, local_calc_function = nothing, local_tolerance = nothing)
     permutations >= 0 || throw(ArgumentError("permutations must be nonnegative"))
     length(data) == length(obs_stat) || throw(ArgumentError("data and observed statistic lengths must match"))
     SpatialDependence._validate_local_precision(backend, precision)
+    SpatialDependence._validate_local_comparison(backend, comparison)
+    comparison === :cpu && !(local_calc_function isa Function) &&
+        throw(ArgumentError("comparison=:cpu requires a CPU statistic closure"))
     validated_seed = SpatialDependence._validate_local_seed(seed)
     actual_backend = if backend === :gpu
         candidates = Tuple{Symbol, Any}[]
@@ -621,7 +684,7 @@ function SpatialDependence.crand_local_gpu(
     # Hoisted above payload construction so Float32 and Float64 reject the same
     # graphs, and so nothing indexes a malformed W before it has been checked.
     _validate_weights_structure(W, n)
-    exact_tails = T === Float32
+    exact_tails = T === Float32 && comparison !== :cpu
     comparison_source = comparison_data === nothing ? data : comparison_data
     exact_payload = exact_tails ? _exact_tail_payload(comparison_source, W; stat_code=Int(stat_code)) : nothing
     if exact_tails
@@ -731,6 +794,10 @@ function SpatialDependence.crand_local_gpu(
         p_values[invalid_summary .& .!exact_payload.defined] .= 1.0
     else
         p_values[invalid_summary] .= 1.0
+    end
+    if comparison === :cpu
+        p_values = _cpu_comparison_pvalues(data, W, obs_stat, permutations,
+                                           base_seed, local_calc_function, local_tolerance)
     end
     if centered_getis
         observed_varying = zeros(Float64, n); wt = wtransformation(W)
